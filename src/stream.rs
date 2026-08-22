@@ -118,7 +118,7 @@ impl BatchStream {
             // Tomar el receiver del mutex compartido. Se reinserta al final
             // (o se dropea en los caminos de error/agotado, lo que hace que
             // la tarea de prefetch vea `send` fallar y suelte el Lease).
-            let mut receiver = {
+            let receiver = {
                 let mut guard = rx.lock().await;
                 guard.take()
             };

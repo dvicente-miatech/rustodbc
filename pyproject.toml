@@ -8,7 +8,7 @@ build-backend = "maturin"
 # rustodbc-mi y el trusted publisher de pypi.org esta registrado para ese
 # nombre exacto; si no coinciden, PyPI rechaza el upload (400).
 name = "rustodbc-mi"
-version = "0.3.0"
+version = "0.4.0"
 description = "Async ODBC engine for IBM DB2 for i (iSeries), written in Rust"
 requires-python = ">=3.12"
 license = { text = "MIT-0" }

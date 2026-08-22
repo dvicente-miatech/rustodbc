@@ -2,7 +2,7 @@
 # Trusted Publishing (OIDC) -- sin token de larga vida que rotar.
 #
 # Requiere configurar, UNA vez, el "trusted publisher" en pypi.org:
-#   Proyecto "rustodbc" -> Publisher: GitHub -> este repo ->
+#   Proyecto "rustodbc-mi" -> Publisher: GitHub -> este repo ->
 #   workflow "publish.yml" -> environment "pypi".
 #
 # El release se arma con release.yml (workflow_dispatch manual) y sube el
@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/rustodbc
+      url: https://pypi.org/project/rustodbc-mi
     permissions:
       id-token: write
       contents: read  # Required for gh release download

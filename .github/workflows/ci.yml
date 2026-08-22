@@ -91,7 +91,7 @@ jobs:
       - name: Instalar wheel y smoke import
         shell: bash
         run: |
-          pip install --force-reinstall target/wheels/rustodbc-*.whl
+          pip install --force-reinstall target/wheels/rustodbc_mi-*.whl
           python -c "import rustodbc; print(rustodbc.__version__)"
 
       # No hay job de integracion contra un IBM i real: requiere un

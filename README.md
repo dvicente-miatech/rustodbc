@@ -18,7 +18,7 @@ la máquina de desarrollo actual para poder compilar).
 Una vez publicado en PyPI:
 
 ```bash
-pip install rustodbc
+pip install rustodbc-mi
 ```
 
 **El wheel solo no alcanza en runtime.** DB2 for i se habla a través del

@@ -3,7 +3,11 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "rustodbc"
+# Nombre de la distribucion en PyPI. El import en Python sigue siendo
+# `rustodbc` (ver [tool.maturin] module-name) -- el paquete PyPI se llama
+# rustodbc-mi y el trusted publisher de pypi.org esta registrado para ese
+# nombre exacto; si no coinciden, PyPI rechaza el upload (400).
+name = "rustodbc-mi"
 version = "0.1.0"
 description = "Async ODBC engine for IBM DB2 for i (iSeries), written in Rust"
 requires-python = ">=3.12"

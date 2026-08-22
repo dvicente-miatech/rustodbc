@@ -11,13 +11,40 @@ use odbc_sys::{
     CDataType, HDbc, HStmt, HandleType, Len, Nullability, ParamType, Pointer, SQLAllocHandle,
     SQLBindParameter, SQLCancel, SQLCloseCursor, SQLDescribeColW, SQLExecDirectW, SQLExecute,
     SQLFetch, SQLFreeHandle, SQLGetData, SQLMoreResults, SQLNumResultCols, SQLPrepareW,
-    SQLRowCount, SqlDataType, SqlReturn, ULen,
+    SQLRowCount, SmallInt, SqlDataType, SqlReturn, ULen, WChar,
 };
 
 use crate::errors::CoreError;
 
 use super::diag::primary_diagnostic;
 use super::wchar::{from_utf16_lossy, to_utf16, utf16_len};
+
+// `odbc-sys` 0.24 no expone `SQLProcedureColumns` como funcion FFI (aunque es
+// ODBC 3 estandar y existe en odbc32.lib/libodbc.so) -- se declara aca, en la
+// capa de contencion del `unsafe`. Devuelve un result set con la metadata de
+// los parametros del procedimiento; la columna 4 es COLUMN_NAME, la 5
+// COLUMN_TYPE (SQL_PARAM_INPUT=1 / SQL_PARAM_INPUT_OUTPUT=2 /
+// SQL_PARAM_OUTPUT=4), la 6 DATA_TYPE y la 8 COLUMN_SIZE.
+extern "system" {
+    fn SQLProcedureColumnsW(
+        statement_handle: HStmt,
+        catalog_name: *const WChar,
+        name_length_1: SmallInt,
+        schema_name: *const WChar,
+        name_length_2: SmallInt,
+        proc_name: *const WChar,
+        name_length_3: SmallInt,
+        column_name: *const WChar,
+        name_length_4: SmallInt,
+    ) -> SqlReturn;
+}
+
+/// Constantes SQL_PARAM_* (devueltas en la columna COLUMN_TYPE de
+/// `SQLProcedureColumns`) -- `odbc-sys` las modela como `ParamType` para
+/// `SQLBindParameter`, pero aqui llegan como enteros del result set.
+pub const SQL_PARAM_INPUT: i16 = 1;
+pub const SQL_PARAM_INPUT_OUTPUT: i16 = 2;
+pub const SQL_PARAM_OUTPUT: i16 = 4;
 
 /// Metadata cruda de una columna del result set (`SQLDescribeColW`).
 /// `sql_type` queda como el codigo crudo (`SqlDataType.0`) -- la capa de
@@ -171,6 +198,29 @@ impl RawStatement {
         })
     }
 
+    /// `SQLProcedureColumnsW` -- abre un result set con la metadata de los
+    /// parametros del procedimiento `schema.proc` (nombre, tipo IN/OUT,
+    /// SQL type, tamano). El llamador lo consume con `fetch()` +
+    /// `get_data_text()` leyendo las columnas 4/5/6/8 (ver constante arriba).
+    pub fn procedure_columns(&self, schema: &str, proc_name: &str) -> Result<(), CoreError> {
+        let schema_u16 = to_utf16(schema);
+        let proc_u16 = to_utf16(proc_name);
+        let ret = unsafe {
+            SQLProcedureColumnsW(
+                self.hstmt,
+                ptr::null(),
+                0,
+                schema_u16.as_ptr(),
+                utf16_len(schema),
+                proc_u16.as_ptr(),
+                utf16_len(proc_name),
+                ptr::null(),
+                0,
+            )
+        };
+        self.check(ret)
+    }
+
     /// `SQLFetch`. `Ok(true)` = hay fila, `Ok(false)` = `SQL_NO_DATA` (fin
     /// del result set).
     pub fn fetch(&self) -> Result<bool, CoreError> {
@@ -295,19 +345,21 @@ impl RawStatement {
         Ok(Some(out))
     }
 
-    /// Bindea un parametro de entrada. `value` y `indicator` deben seguir
-    /// vivos hasta despues de `execute()` -- `SQLBindParameter` solo
-    /// registra punteros, el driver los lee recien al ejecutar. El llamador
-    /// (`params.rs`) es responsable de mantener los buffers vivos en un
-    /// `Vec` hasta que `execute()` retorne.
+    /// Bindea un parametro con su tipo de I/O (`ParamType::Input`,
+    /// `InputOutput` u `Output`). `value` y `indicator` deben seguir vivos
+    /// hasta despues de `execute()` -- `SQLBindParameter` solo registra
+    /// punteros, el driver los lee/escribe recien al ejecutar. El llamador es
+    /// responsable de mantener los buffers vivos hasta que `execute()`
+    /// retorne (y, para OUT/INOUT, hasta leerlos).
     ///
     /// `param` es 1-based.
     // Wrapper seguro sobre SQLBindParameter: los punteros se pasan al driver
     // (que los deref del otro lado), nunca se deref en Rust.
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
-    pub fn bind_input_parameter(
+    pub fn bind_parameter(
         &self,
         param: u16,
+        io_type: ParamType,
         c_type: CDataType,
         sql_type: SqlDataType,
         column_size: usize,
@@ -320,7 +372,7 @@ impl RawStatement {
             SQLBindParameter(
                 self.hstmt,
                 param,
-                ParamType::Input,
+                io_type,
                 c_type,
                 sql_type,
                 column_size as ULen,

@@ -59,7 +59,7 @@ struct ParamBuffer {
 }
 
 fn bind_params(stmt: &RawStatement, params: &[ParamValue]) -> Result<Vec<ParamBuffer>, CoreError> {
-    use odbc_sys::{CDataType, SqlDataType};
+    use odbc_sys::{CDataType, ParamType, SqlDataType};
 
     let mut buffers = Vec::with_capacity(params.len());
 
@@ -68,8 +68,9 @@ fn bind_params(stmt: &RawStatement, params: &[ParamValue]) -> Result<Vec<ParamBu
         match p {
             ParamValue::Null => {
                 let mut indicator = Box::new(odbc_sys::NULL_DATA);
-                stmt.bind_input_parameter(
+                stmt.bind_parameter(
                     param_no,
+                    ParamType::Input,
                     CDataType::WChar,
                     SqlDataType::VARCHAR,
                     1,
@@ -91,8 +92,9 @@ fn bind_params(stmt: &RawStatement, params: &[ParamValue]) -> Result<Vec<ParamBu
                 let byte_len = (units.len() * std::mem::size_of::<u16>()) as odbc_sys::Len;
                 let mut indicator = Box::new(byte_len);
                 let ptr = units.as_mut_ptr() as odbc_sys::Pointer;
-                stmt.bind_input_parameter(
+                stmt.bind_parameter(
                     param_no,
+                    ParamType::Input,
                     CDataType::WChar,
                     SqlDataType::VARCHAR,
                     units.len().max(1),
@@ -114,8 +116,9 @@ fn bind_params(stmt: &RawStatement, params: &[ParamValue]) -> Result<Vec<ParamBu
                 let byte_len = std::mem::size_of::<i64>() as odbc_sys::Len;
                 let mut indicator = Box::new(byte_len);
                 let ptr = boxed.as_mut() as *mut i64 as odbc_sys::Pointer;
-                stmt.bind_input_parameter(
+                stmt.bind_parameter(
                     param_no,
+                    ParamType::Input,
                     CDataType::SBigInt,
                     SqlDataType::EXT_BIG_INT,
                     20,
@@ -137,8 +140,9 @@ fn bind_params(stmt: &RawStatement, params: &[ParamValue]) -> Result<Vec<ParamBu
                 let byte_len = std::mem::size_of::<f64>() as odbc_sys::Len;
                 let mut indicator = Box::new(byte_len);
                 let ptr = boxed.as_mut() as *mut f64 as odbc_sys::Pointer;
-                stmt.bind_input_parameter(
+                stmt.bind_parameter(
                     param_no,
+                    ParamType::Input,
                     CDataType::Double,
                     SqlDataType::DOUBLE,
                     15,
@@ -160,8 +164,9 @@ fn bind_params(stmt: &RawStatement, params: &[ParamValue]) -> Result<Vec<ParamBu
                 let byte_len = owned.len() as odbc_sys::Len;
                 let mut indicator = Box::new(byte_len);
                 let ptr = owned.as_mut_ptr() as odbc_sys::Pointer;
-                stmt.bind_input_parameter(
+                stmt.bind_parameter(
                     param_no,
+                    ParamType::Input,
                     CDataType::Binary,
                     SqlDataType::EXT_VAR_BINARY,
                     owned.len().max(1),
@@ -185,8 +190,125 @@ fn bind_params(stmt: &RawStatement, params: &[ParamValue]) -> Result<Vec<ParamBu
 }
 
 // ---------------------------------------------------------------------------
-// ColumnValue -- aca -> Python
+// call_proc -- metadata de parametros + bindeo con OUT/INOUT
 // ---------------------------------------------------------------------------
+
+/// Metadata de un parametro de procedimiento, leida de `SQLProcedureColumns`.
+/// `io_type` es `SQL_PARAM_INPUT`(1)/`SQL_PARAM_INPUT_OUTPUT`(2)/`SQL_PARAM_OUTPUT`(4)
+/// (ver `ffi::stmt::SQL_PARAM_*`).
+#[derive(Debug, Clone)]
+pub struct ProcParam {
+    pub name: String,
+    pub io_type: i16,
+    pub sql_type: i16,
+    pub column_size: usize,
+}
+
+/// Buffer de un parametro de `CALL`. Para IN/INOUT el valor de entrada se
+/// escribe en el buffer ANTES de ejecutar; para OUT/INOUT el driver escribe el
+/// resultado EN el mismo buffer (o en `_out`) y deja la longitud en
+/// `_indicator` despues de `SQLExecute`. `read_out()` recupera el texto.
+struct ProcParamBuffer {
+    _buf: Vec<u16>,
+    _indicator: Box<odbc_sys::Len>,
+}
+
+impl ProcParamBuffer {
+    fn read_out(&self) -> Option<String> {
+        let ind = *self._indicator;
+        if ind == odbc_sys::NULL_DATA {
+            return None;
+        }
+        // `ind` viene en BYTES para SQL_C_WCHAR (como en get_data_text).
+        let units = if ind < 0 {
+            self._buf.len()
+        } else {
+            ((ind as usize) / std::mem::size_of::<u16>()).min(self._buf.len())
+        };
+        Some(ffi::wchar::from_utf16_lossy(&self._buf[..units]))
+    }
+}
+
+fn param_value_to_text(v: Option<&ParamValue>) -> Option<String> {
+    match v {
+        None => None,
+        Some(ParamValue::Null) => None,
+        Some(ParamValue::Text(s)) => Some(s.clone()),
+        Some(ParamValue::I64(i)) => Some(i.to_string()),
+        Some(ParamValue::F64(f)) => Some(f.to_string()),
+        Some(ParamValue::Bytes(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+    }
+}
+
+/// Bindeo de los parametros de un `CALL`. Igual que `bind_params`, los
+/// buffers deben seguir vivos hasta despues de `execute()` -- este `Vec` es
+/// quien los sostiene, y de donde `Lease::call_proc` lee los OUT despues.
+fn bind_proc_params(
+    stmt: &RawStatement,
+    params: &[ProcParam],
+    values: &[Option<ParamValue>],
+) -> Result<Vec<ProcParamBuffer>, CoreError> {
+    use odbc_sys::{CDataType, ParamType, SqlDataType};
+
+    let mut buffers = Vec::with_capacity(params.len());
+
+    for (i, p) in params.iter().enumerate() {
+        let param_no = (i + 1) as u16;
+        let is_out = p.io_type == ffi::stmt::SQL_PARAM_OUTPUT
+            || p.io_type == ffi::stmt::SQL_PARAM_INPUT_OUTPUT;
+        let is_in = p.io_type == ffi::stmt::SQL_PARAM_INPUT
+            || p.io_type == ffi::stmt::SQL_PARAM_INPUT_OUTPUT;
+
+        // El C++ (cursor.cpp) toma COLUMN_SIZE del catalogo, capa a [256, 64KB],
+        // y bindea todo como texto. Aca lo mismo pero UTF-16.
+        let cap = p.column_size.clamp(1, 65536);
+        let mut buf = vec![0u16; cap];
+        let mut indicator = Box::new(odbc_sys::Len::default());
+
+        // Escribir el valor de entrada si lo hay (IN/INOUT); si no, NULL.
+        if is_in {
+            if let Some(text) = param_value_to_text(values.get(i).and_then(|v| v.as_ref())) {
+                let units = text.encode_utf16().collect::<Vec<_>>();
+                let n = units.len().min(cap);
+                buf[..n].copy_from_slice(&units[..n]);
+                *indicator = (n * std::mem::size_of::<u16>()) as odbc_sys::Len;
+            } else {
+                *indicator = odbc_sys::NULL_DATA;
+            }
+        } else if is_out {
+            // OUT puro: el driver escribe el resultado; el indicador de entrada
+            // no importa (el driver lo sobreescribe).
+            *indicator = odbc_sys::NULL_DATA;
+        }
+
+        let io_type = match p.io_type {
+            ffi::stmt::SQL_PARAM_INPUT_OUTPUT => ParamType::InputOutput,
+            ffi::stmt::SQL_PARAM_OUTPUT => ParamType::Output,
+            _ => ParamType::Input,
+        };
+
+        let byte_len = (buf.len() * std::mem::size_of::<u16>()) as odbc_sys::Len;
+        let ptr = buf.as_mut_ptr() as odbc_sys::Pointer;
+        stmt.bind_parameter(
+            param_no,
+            io_type,
+            CDataType::WChar,
+            SqlDataType::VARCHAR,
+            cap,
+            0,
+            ptr,
+            byte_len,
+            indicator.as_mut(),
+        )?;
+
+        buffers.push(ProcParamBuffer {
+            _buf: buf,
+            _indicator: indicator,
+        });
+    }
+
+    Ok(buffers)
+}
 
 /// Valor de columna crudo, ya leido del driver pero sin convertir a un tipo
 /// de Python. `Text` incluye numeros/decimales/fechas -- `crate::rows`
@@ -354,14 +476,71 @@ impl Lease {
         })
     }
 
-    /// Ejecuta un `CALL` (u otro statement multi-result-set) y trae TODOS
-    /// los result sets completos. Usado por `proc::call_proc` -- OUT/INOUT
-    /// params quedan para una fase futura (ver `proc.rs`); esta primera
-    /// pasada solo soporta parametros de entrada posicionales.
-    pub fn call(&self, sql: &str, params: &[ParamValue]) -> Result<CallResult, CoreError> {
+    /// Lee la metadata de los parametros del procedimiento `schema.proc` via
+    /// `SQLProcedureColumns` (nombre, tipo IN/INOUT/OUT, SQL type, tamano),
+    /// en orden ordinal. Solo incluye parametros IN/INOUT/OUT (no
+    /// SQL_RETURN_VALUE). Devuelve `Vec` vacio si el procedimiento no existe
+    /// o no tiene parametros.
+    pub fn proc_columns(&self, schema: &str, proc_name: &str) -> Result<Vec<ProcParam>, CoreError> {
         let stmt = RawStatement::alloc(self.hdbc())?;
-        let _buffers = bind_params(&stmt, params)?;
-        stmt.exec_direct(sql)?;
+        stmt.procedure_columns(schema, proc_name)?;
+
+        let mut params = Vec::new();
+        while stmt.fetch()? {
+            // Columnas de SQLProcedureColumns: 4=COLUMN_NAME, 5=COLUMN_TYPE,
+            // 6=DATA_TYPE, 8=COLUMN_SIZE. Se leen como texto (SQLGetData).
+            let name = stmt.get_data_text(4)?.unwrap_or_default();
+            let io_type = stmt
+                .get_data_text(5)?
+                .and_then(|s| s.trim().parse::<i16>().ok())
+                .unwrap_or(0);
+            let sql_type = stmt
+                .get_data_text(6)?
+                .and_then(|s| s.trim().parse::<i16>().ok())
+                .unwrap_or(0);
+            let column_size = stmt
+                .get_data_text(8)?
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+
+            let is_param = io_type == ffi::stmt::SQL_PARAM_INPUT
+                || io_type == ffi::stmt::SQL_PARAM_INPUT_OUTPUT
+                || io_type == ffi::stmt::SQL_PARAM_OUTPUT;
+            if is_param {
+                params.push(ProcParam {
+                    name,
+                    io_type,
+                    sql_type,
+                    column_size,
+                });
+            }
+        }
+        Ok(params)
+    }
+
+    /// Ejecuta un `CALL schema.proc(?,...)` con bindeo por tipo de I/O
+    /// (IN/INOUT/OUT) y trae:
+    /// - todos los result sets (multiples via `SQLMoreResults`), y
+    /// - los valores OUT/INOUT leidos de los buffers despues de ejecutar.
+    ///
+    /// `metadata` es el resultado de `proc_columns` (mismo orden); `values`
+    /// son los valores de entrada por posicion (`None` = NULL de entrada; los
+    /// OUT pueden ir como `None` sin problema -- el driver escribe el
+    /// resultado). Devuelve `(result_sets, out_params)` donde `out_params` es
+    /// `(indice_en_metadata, texto_o_NULL)` para cada OUT/INOUT.
+    pub fn call_proc(
+        &self,
+        schema: &str,
+        proc_name: &str,
+        metadata: &[ProcParam],
+        values: &[Option<ParamValue>],
+    ) -> Result<(CallResult, Vec<(usize, Option<String>)>), CoreError> {
+        let placeholders = vec!["?"; metadata.len()].join(",");
+        let sql = format!("{{CALL {schema}.{proc_name}({placeholders})}}");
+
+        let stmt = RawStatement::alloc(self.hdbc())?;
+        let buffers = bind_proc_params(&stmt, metadata, values)?;
+        stmt.exec_direct(&sql)?;
 
         let mut result_sets = Vec::new();
         loop {
@@ -377,7 +556,18 @@ impl Lease {
                 break;
             }
         }
-        Ok(result_sets)
+
+        // Leer OUT/INOUT de los buffers (que `bind_proc_params` mantuvo vivos).
+        let mut out_params = Vec::new();
+        for (i, p) in metadata.iter().enumerate() {
+            if p.io_type == ffi::stmt::SQL_PARAM_OUTPUT
+                || p.io_type == ffi::stmt::SQL_PARAM_INPUT_OUTPUT
+            {
+                out_params.push((i, buffers[i].read_out()));
+            }
+        }
+
+        Ok((result_sets, out_params))
     }
 }
 

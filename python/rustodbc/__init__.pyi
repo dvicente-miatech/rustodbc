@@ -100,7 +100,7 @@ class Db2iEngine:
                batch_size: int | None = ...) -> "BatchStream": ...
     async def executebatch(self, sql: str, rows: Sequence[Sequence[Value]]) -> BulkReport: ...
     async def call_proc(self, schema: str, proc: str,
-                         params: Sequence[Value] | None = ...) -> "ProcResult": ...
+                         params: Mapping[str, Value] | None = ...) -> "ProcResult": ...
     def table_sync(self, source: "Db2iEngine | None" = ...) -> "TableSync": ...
 
 class BatchStream:
@@ -130,6 +130,7 @@ def plan_concurrency(total_rows: int, min_rows_per_worker: int, max_workers: int
 
 class ProcResult:
     result_sets: list[list[Row]]
+    out_params: dict[str, Value]
 
 class MergeReport:
     rows_affected: int

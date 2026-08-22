@@ -208,12 +208,40 @@ pub(crate) async fn executebatch_impl(
     rows: Vec<Vec<ParamValue>>,
     chunk_size: usize,
 ) -> PyResult<crate::bulk::BulkReport> {
+    // A3: un solo lease para todo el batch (no uno por chunk).
+    let lease = engine.acquire().await.map_err(to_py_err)?;
+    let limits = engine.limits.clone();
     tokio::task::spawn_blocking(move || {
-        crate::bulk::executebatch_core(&engine, &sql, rows, chunk_size)
+        crate::bulk::executebatch_core_with_lease(&lease, &limits, &sql, rows, chunk_size)
     })
     .await
     .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
     .map_err(to_py_err)
+}
+
+pub(crate) async fn batch_execute_impl(
+    engine: SharedEngine,
+    sql: String,
+    rows: Vec<Vec<ParamValue>>,
+    chunk_size: usize,
+    workers: usize,
+    fail_fast: bool,
+) -> PyResult<crate::bulk::ParallelReport> {
+    crate::bulk::batch_execute_async(&engine, sql, rows, chunk_size, workers, fail_fast)
+        .await
+        .map_err(to_py_err)
+}
+
+pub(crate) async fn parallel_execute_impl(
+    engine: SharedEngine,
+    tasks: Vec<(String, Vec<Vec<ParamValue>>)>,
+    chunk_size: usize,
+    workers: usize,
+    fail_fast: bool,
+) -> PyResult<crate::bulk::ParallelReport> {
+    crate::bulk::parallel_execute_async(&engine, tasks, chunk_size, workers, fail_fast)
+        .await
+        .map_err(to_py_err)
 }
 
 pub(crate) async fn call_proc_impl(
@@ -449,6 +477,67 @@ impl Db2iEngine {
         pyo3_async_runtimes::tokio::future_into_py(
             py,
             executebatch_impl(engine, sql, rows, chunk_size),
+        )
+    }
+
+    /// Ejecuta `INSERT ... VALUES (?,...)` contra `rows` en paralelo
+    /// (`workers` conexiones del pool). Reglas: sin exito parcial silencioso
+    /// (se juntan todos los errores), `fail_fast=True` cancela el resto al
+    /// primer error.
+    #[pyo3(signature = (sql, rows, *, max_workers=None, fail_fast=false))]
+    fn batch_execute<'py>(
+        &self,
+        py: Python<'py>,
+        sql: String,
+        rows: Bound<'py, PyAny>,
+        max_workers: Option<usize>,
+        fail_fast: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let rows = crate::bulk::rows_to_param_values(py, &rows)?;
+        let engine = self.engine.clone();
+        let chunk_size = self.options.batch_size;
+        let workers = max_workers.unwrap_or(self.options.max_workers);
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            batch_execute_impl(engine, sql, rows, chunk_size, workers, fail_fast),
+        )
+    }
+
+    /// Ejecuta `tasks` (lista de `(sql, rows)`) en paralelo, cada una con su
+    /// propio lease. Mismo drenado sin exito parcial silencioso.
+    #[pyo3(signature = (tasks, *, max_workers=None, fail_fast=false))]
+    fn parallel_execute<'py>(
+        &self,
+        py: Python<'py>,
+        tasks: Bound<'py, PyAny>,
+        max_workers: Option<usize>,
+        fail_fast: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let engine = self.engine.clone();
+        let chunk_size = self.options.batch_size;
+        let workers = max_workers.unwrap_or(self.options.max_workers);
+
+        let mut tasks_vec = Vec::new();
+        for item in tasks.iter()? {
+            let item = item?;
+            let tuple = item.downcast::<pyo3::types::PyTuple>().map_err(|_| {
+                to_py_err(crate::errors::CoreError::Parameter(
+                    "parallel_execute: cada tarea debe ser una tupla (sql, rows)".to_string(),
+                ))
+            })?;
+            if tuple.len() != 2 {
+                return Err(to_py_err(crate::errors::CoreError::Parameter(
+                    "parallel_execute: cada tarea debe ser una tupla (sql, rows)".to_string(),
+                )));
+            }
+            let sql: String = tuple.get_item(0)?.extract()?;
+            let rows = crate::bulk::rows_to_param_values(py, &tuple.get_item(1)?)?;
+            tasks_vec.push((sql, rows));
+        }
+
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            parallel_execute_impl(engine, tasks_vec, chunk_size, workers, fail_fast),
         )
     }
 

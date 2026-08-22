@@ -93,6 +93,14 @@ pub fn classify_sqlcode(native_code: i32) -> SqlCodeClass {
     }
 }
 
+/// SQLCODEs de DB2 for i que indican que el *statement* generado es demasiado
+/// grande para este sistema (statement demasiado largo o demasiados
+/// parametros) -- el halve-and-retry de chunk size (ver AGENTS.md ss9) los
+/// usa para reducir el lote y reintentar en vez de abortar el batch entero.
+pub fn is_reducible_size(native_code: i32) -> bool {
+    matches!(native_code.abs(), 101 | 54001) // SQL0101 | SQL54001
+}
+
 /// Enum de error interno de Rust (capa `rustodbc-core`, sin PyO3). Se mapea a
 /// una excepcion Python concreta en el borde de la capa PyO3 (`to_py_err`).
 #[derive(thiserror::Error, Debug)]
@@ -145,6 +153,14 @@ impl CoreError {
     pub fn sqlcode_class(&self) -> Option<SqlCodeClass> {
         match self {
             CoreError::Query { native_code, .. } => Some(classify_sqlcode(*native_code)),
+            _ => None,
+        }
+    }
+
+    /// `Some(native_code)` si es un `CoreError::Query` (SQLCODE de DB2 for i).
+    pub fn native_code(&self) -> Option<i32> {
+        match self {
+            CoreError::Query { native_code, .. } => Some(*native_code),
             _ => None,
         }
     }

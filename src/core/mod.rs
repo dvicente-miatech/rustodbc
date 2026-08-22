@@ -630,8 +630,22 @@ impl managed::Manager for ConnManager {
 // Engine -- pool + DSN resuelto
 // ---------------------------------------------------------------------------
 
+/// Limites descubiertos de statement/parametros para este engine (ver
+/// AGENTS.md ss9, halve-and-retry contra SQL0101/SQL54001). Memoizado por
+/// engine (no global): cada `Engine` corresponde a un DSN/conexion y los
+/// limites reales de DB2 for i pueden variar entre sistemas.
+#[derive(Debug, Default)]
+pub struct StatementLimits {
+    /// Maximas filas por statement multi-row (por columna) que el driver
+    /// acepta -- descubierto por halve-and-retry. `None` = todavia no se
+    /// probo.
+    pub max_rows_per_statement: Option<usize>,
+}
+
 pub struct Engine {
     pool: Pool<ConnManager>,
+    /// Cache de limites de statement descubiertos por halve-and-retry.
+    pub limits: std::sync::Arc<std::sync::Mutex<StatementLimits>>,
 }
 
 impl Engine {
@@ -656,7 +670,10 @@ impl Engine {
             .build()
             .map_err(|e| CoreError::Configuration(format!("no se pudo armar el pool: {e}")))?;
 
-        Ok(Engine { pool })
+        Ok(Engine {
+            pool,
+            limits: std::sync::Arc::new(std::sync::Mutex::new(StatementLimits::default())),
+        })
     }
 
     pub async fn acquire(&self) -> Result<Lease, CoreError> {

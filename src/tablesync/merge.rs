@@ -9,8 +9,12 @@
 //!   degrada a `INSERT` simple con warning antes de llegar aca.
 //! - Sin exito parcial silencioso: cada chunk que falla propaga el error tal
 //!   cual, sin intentar seguir con los chunks restantes.
+//! - Los limites de statement (SQL0101/SQL54001) se manejan con
+//!   halve-and-retry compartido con `executebatch` (ver
+//!   `crate::bulk::execute_chunked_with_limits`).
 
-use crate::core::{Lease, ParamValue};
+use crate::bulk::execute_chunked_with_limits;
+use crate::core::{Lease, ParamValue, StatementLimits};
 use crate::errors::CoreError;
 
 fn quote_ident(id: &str) -> String {
@@ -69,10 +73,12 @@ fn build_merge_sql(
     )
 }
 
-/// Ejecuta el MERGE en chunks de `chunk_size` filas. Devuelve
+/// Ejecuta el MERGE en chunks de `chunk_size` filas, con halve-and-retry de
+/// chunk size contra SQL0101/SQL54001 (memoizado en `limits`). Devuelve
 /// `(rows_affected_total, chunks)`.
 pub fn merge_rows(
     lease: &Lease,
+    limits: &std::sync::Mutex<StatementLimits>,
     schema: &str,
     table: &str,
     pk_columns: &[String],
@@ -80,54 +86,66 @@ pub fn merge_rows(
     rows: &[Vec<ParamValue>],
     chunk_size: usize,
 ) -> Result<(i64, usize), CoreError> {
-    let chunk_size = chunk_size.max(1);
-    let mut total = 0i64;
-    let mut chunks = 0usize;
+    let cached = limits
+        .lock()
+        .unwrap()
+        .max_rows_per_statement
+        .unwrap_or(chunk_size);
 
-    for chunk in rows.chunks(chunk_size) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let sql = build_merge_sql(schema, table, pk_columns, columns, chunk.len());
-        let flat_params: Vec<ParamValue> = chunk.iter().flat_map(|r| r.iter().cloned()).collect();
-        let affected = lease.execute(&sql, &flat_params)?;
-        total += affected;
-        chunks += 1;
+    let (total, chunks, discovered) = execute_chunked_with_limits(
+        lease,
+        chunk_size,
+        rows,
+        |n| build_merge_sql(schema, table, pk_columns, columns, n),
+        |chunk| chunk.iter().flat_map(|r| r.iter().cloned()).collect(),
+        Some(cached),
+    )?;
+
+    if let Some(d) = discovered {
+        limits.lock().unwrap().max_rows_per_statement = Some(d);
     }
 
     Ok((total, chunks))
 }
 
-/// INSERT simple (sin PK -- ver regla dura de arriba), en los mismos chunks.
+/// INSERT simple (sin PK -- ver regla dura de arriba), en los mismos chunks,
+/// con halve-and-retry compartido.
 pub fn insert_only_rows(
     lease: &Lease,
+    limits: &std::sync::Mutex<StatementLimits>,
     schema: &str,
     table: &str,
     columns: &[String],
     rows: &[Vec<ParamValue>],
     chunk_size: usize,
 ) -> Result<(i64, usize), CoreError> {
-    let chunk_size = chunk_size.max(1);
     let qualified_table = format!("{}.{}", quote_ident(schema), quote_ident(table));
     let cols_quoted: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
     let row_placeholder = format!("({})", vec!["?"; columns.len()].join(","));
 
-    let mut total = 0i64;
-    let mut chunks = 0usize;
+    let cached = limits
+        .lock()
+        .unwrap()
+        .max_rows_per_statement
+        .unwrap_or(chunk_size);
 
-    for chunk in rows.chunks(chunk_size) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let values_clause = vec![row_placeholder.clone(); chunk.len()].join(",");
-        let sql = format!(
-            "INSERT INTO {qualified_table} ({}) VALUES {values_clause}",
-            cols_quoted.join(",")
-        );
-        let flat_params: Vec<ParamValue> = chunk.iter().flat_map(|r| r.iter().cloned()).collect();
-        let affected = lease.execute(&sql, &flat_params)?;
-        total += affected;
-        chunks += 1;
+    let (total, chunks, discovered) = execute_chunked_with_limits(
+        lease,
+        chunk_size,
+        rows,
+        |n| {
+            let values_clause = vec![row_placeholder.clone(); n].join(",");
+            format!(
+                "INSERT INTO {qualified_table} ({}) VALUES {values_clause}",
+                cols_quoted.join(",")
+            )
+        },
+        |chunk| chunk.iter().flat_map(|r| r.iter().cloned()).collect(),
+        Some(cached),
+    )?;
+
+    if let Some(d) = discovered {
+        limits.lock().unwrap().max_rows_per_statement = Some(d);
     }
 
     Ok((total, chunks))

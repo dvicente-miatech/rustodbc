@@ -21,8 +21,9 @@ use secrecy::SecretString;
 use crate::config::{Credentials, EngineOptions};
 use crate::core::{Lease, ParamValue, SharedEngine};
 use crate::engine::{
-    call_proc_impl, connect_impl, execute_impl, executebatch_impl, fetch_all_impl,
-    fetch_column_impl, fetch_one_impl, fetch_value_impl, query_cursor_impl, resolve_dsn,
+    batch_execute_impl, call_proc_impl, connect_impl, execute_impl, executebatch_impl,
+    fetch_all_impl, fetch_column_impl, fetch_one_impl, fetch_value_impl, parallel_execute_impl,
+    query_cursor_impl, resolve_dsn,
 };
 use crate::errors::{to_py_err, CoreError};
 use crate::params::params_from_python;
@@ -224,6 +225,63 @@ impl BlockingEngine {
         let engine = self.engine.clone();
         let chunk_size = self.options.batch_size;
         py.allow_threads(move || self.block_on(executebatch_impl(engine, sql, rows, chunk_size)))
+    }
+
+    #[pyo3(signature = (sql, rows, *, max_workers=None, fail_fast=false))]
+    fn batch_execute(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        rows: Bound<'_, PyAny>,
+        max_workers: Option<usize>,
+        fail_fast: bool,
+    ) -> PyResult<crate::bulk::ParallelReport> {
+        check_no_running_loop(py)?;
+        let rows = crate::bulk::rows_to_param_values(py, &rows)?;
+        let engine = self.engine.clone();
+        let chunk_size = self.options.batch_size;
+        let workers = max_workers.unwrap_or(self.options.max_workers);
+        py.allow_threads(move || {
+            self.block_on(batch_execute_impl(
+                engine, sql, rows, chunk_size, workers, fail_fast,
+            ))
+        })
+    }
+
+    #[pyo3(signature = (tasks, *, max_workers=None, fail_fast=false))]
+    fn parallel_execute(
+        &self,
+        py: Python<'_>,
+        tasks: Bound<'_, PyAny>,
+        max_workers: Option<usize>,
+        fail_fast: bool,
+    ) -> PyResult<crate::bulk::ParallelReport> {
+        check_no_running_loop(py)?;
+        let mut tasks_vec = Vec::new();
+        for item in tasks.iter()? {
+            let item = item?;
+            let tuple = item.downcast::<pyo3::types::PyTuple>().map_err(|_| {
+                to_py_err(crate::errors::CoreError::Parameter(
+                    "parallel_execute: cada tarea debe ser una tupla (sql, rows)".to_string(),
+                ))
+            })?;
+            if tuple.len() != 2 {
+                return Err(to_py_err(crate::errors::CoreError::Parameter(
+                    "parallel_execute: cada tarea debe ser una tupla (sql, rows)".to_string(),
+                )));
+            }
+            let sql: String = tuple.get_item(0)?.extract()?;
+            let rows = crate::bulk::rows_to_param_values(py, &tuple.get_item(1)?)?;
+            tasks_vec.push((sql, rows));
+        }
+        let engine = self.engine.clone();
+        let chunk_size = self.options.batch_size;
+        let workers = max_workers.unwrap_or(self.options.max_workers);
+        py.allow_threads(move || {
+            self.block_on(parallel_execute_impl(
+                engine, tasks_vec, chunk_size, workers, fail_fast,
+            ))
+        })
     }
 
     #[pyo3(signature = (schema, proc, params=None))]

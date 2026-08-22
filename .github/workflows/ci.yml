@@ -49,6 +49,14 @@ jobs:
             echo "::error::$(echo "$line" | head -c 500)"
           done || true
 
+      - name: Subir log completo como artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-log-${{ matrix.os }}
+          path: /tmp/clippy.log
+          if-no-files-found: ignore
+
       - name: Gate -- lint
         if: steps.lint.outcome == 'failure'
         run: exit 1
@@ -104,6 +112,14 @@ jobs:
           grep -E "^error|^warning|^  -->|^error\[|^warning\[|doesn't|not found|cannot|expected|mismatched" /tmp/check.log 2>/dev/null | head -200 | while IFS= read -r line; do
             echo "::error::$(echo "$line" | head -c 500)"
           done || true
+
+      - name: Subir log completo como artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-log-${{ matrix.os }}
+          path: /tmp/check.log
+          if-no-files-found: ignore
 
       - name: Gate -- check
         if: steps.check.outcome == 'failure'

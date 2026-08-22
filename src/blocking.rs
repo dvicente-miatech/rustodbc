@@ -70,7 +70,7 @@ impl BlockingEngine {
             })?;
 
         let opts_for_connect = options.clone();
-        let engine = runtime.block_on(async move { connect_impl(dsn, &opts_for_connect).await })?;
+        let engine = runtime.block_on(async move { connect_impl(dsn, opts_for_connect).await })?;
 
         Ok(BlockingEngine {
             engine: Arc::new(engine),
@@ -244,7 +244,7 @@ impl BlockingEngine {
         let decimal_mode = self.options.decimal_mode.clone();
         py.allow_threads(move || {
             self.block_on(call_proc_impl(
-                &engine,
+                engine,
                 schema,
                 proc,
                 params_owned,

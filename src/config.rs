@@ -361,18 +361,18 @@ fn apply_option(opts: &mut EngineOptions, key: &str, value: Bound<'_, PyAny>) ->
     macro_rules! set_usize {
         ($field:ident) => {{
             opts.$field = value.extract()?;
-            return Ok(());
+            Ok(())
         }};
     }
     match key {
         "pool_size" => set_usize!(pool_size),
         "login_timeout" => {
             opts.login_timeout = value.extract()?;
-            return Ok(());
+            Ok(())
         }
         "query_timeout" => {
             opts.query_timeout = value.extract()?;
-            return Ok(());
+            Ok(())
         }
         "batch_size" => set_usize!(batch_size),
         "max_workers" => set_usize!(max_workers),
@@ -383,17 +383,15 @@ fn apply_option(opts: &mut EngineOptions, key: &str, value: Bound<'_, PyAny>) ->
         "prefetch_batches" => set_usize!(prefetch_batches),
         "decimal_mode" => {
             opts.decimal_mode = value.extract()?;
-            return Ok(());
+            Ok(())
         }
         "strip_char_padding" => {
             opts.strip_char_padding = value.extract()?;
-            return Ok(());
+            Ok(())
         }
-        other => {
-            return Err(to_py_err(CoreError::Configuration(format!(
-                "EngineOptions: opcion desconocida {other:?}"
-            ))))
-        }
+        other => Err(to_py_err(CoreError::Configuration(format!(
+            "EngineOptions: opcion desconocida {other:?}"
+        )))),
     }
 }
 

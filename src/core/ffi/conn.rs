@@ -98,9 +98,8 @@ impl RawConnection {
 
         if ret != SqlReturn::SUCCESS && ret != SqlReturn::SUCCESS_WITH_INFO {
             let diag = primary_diagnostic(HandleType::Dbc, hdbc as *mut _);
-            unsafe {
-                SQLFreeHandle(HandleType::Dbc, hdbc as *mut _);
-            }
+            // SqlReturn es #[must_use] -- descartar explicito.
+            let _ = unsafe { SQLFreeHandle(HandleType::Dbc, hdbc as *mut _) };
             return Err(CoreError::from_diagnostic(diag));
         }
 

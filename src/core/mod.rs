@@ -358,11 +358,7 @@ impl Lease {
     /// los result sets completos. Usado por `proc::call_proc` -- OUT/INOUT
     /// params quedan para una fase futura (ver `proc.rs`); esta primera
     /// pasada solo soporta parametros de entrada posicionales.
-    pub fn call(
-        &self,
-        sql: &str,
-        params: &[ParamValue],
-    ) -> Result<Vec<(Vec<ColumnMeta>, Vec<Vec<ColumnValue>>)>, CoreError> {
+    pub fn call(&self, sql: &str, params: &[ParamValue]) -> Result<CallResult, CoreError> {
         let stmt = RawStatement::alloc(self.hdbc())?;
         let _buffers = bind_params(&stmt, params)?;
         stmt.exec_direct(sql)?;
@@ -489,3 +485,7 @@ impl Engine {
 /// Comparte el `Engine` entre las tareas async de tokio -- `Db2iEngine`
 /// (capa PyO3) guarda un `Arc<Engine>` y lo clona en cada `spawn`.
 pub type SharedEngine = Arc<Engine>;
+
+/// Resultado de `Lease::call`: todos los result sets de un statement
+/// multi-resultado (`(columnas, filas)` por cada uno).
+pub type CallResult = Vec<(Vec<ColumnMeta>, Vec<Vec<ColumnValue>>)>;

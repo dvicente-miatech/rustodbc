@@ -91,9 +91,9 @@ impl Db2iEngine {
         credentials: PyRef<'_, Credentials>,
         options: Option<EngineOptions>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // `credentials` es un `PyRef` (prestamo a la instancia Python); hay
-        // que deref explicito para pasarlo como `&Credentials`.
-        let dsn = resolve_dsn(&*credentials)?;
+        // `credentials` es un `PyRef`; la deref coercion de Rust lo convierte
+        // a `&Credentials` automaticamente en el argumento.
+        let dsn = resolve_dsn(&credentials)?;
         Db2iEngine::connect_with_dsn(py, dsn, options.unwrap_or_default())
     }
 

@@ -17,6 +17,11 @@ const MESSAGE_BUFFER_LEN: usize = 1024;
 /// primer registro) -- `SQLGetDiagRecW` puede devolver varios registros para
 /// un mismo error, y descartar los siguientes pierde contexto real (p.ej.
 /// una violacion de constraint que trae detalle en el segundo registro).
+///
+/// Wrapper seguro sobre FFI: el puntero `handle` se pasa a `SQLGetDiagRecW`
+/// (la funcion C lo dereferencia del otro lado), nunca se deref en Rust --
+/// el lint `not_unsafe_ptr_arg_deref` no puede saberlo.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn collect_diagnostics(handle_type: HandleType, handle: Handle) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut rec_number: i16 = 1;

@@ -59,6 +59,7 @@ fn make_time(py: Python<'_>, h: u8, mi: u8, s: u8, micro: u32) -> PyResult<PyObj
     Ok(dtmod.call_method1("time", (h, mi, s, micro))?.unbind())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_datetime(
     py: Python<'_>,
     y: i32,

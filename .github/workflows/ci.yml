@@ -144,8 +144,25 @@ jobs:
       - name: pip install maturin
         run: python -m pip install --upgrade pip "maturin>=1.7,<2.0"
 
-      - name: maturin develop --release
-        run: maturin develop --release
+      - name: maturin develop --release (captura de errores)
+        id: maturin
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          maturin develop --release 2>&1 | tee /tmp/maturin.log
+
+      - name: Subir log de maturin como artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maturin-log-${{ matrix.os }}
+          path: /tmp/maturin.log
+          if-no-files-found: ignore
+
+      - name: Gate -- maturin
+        if: steps.maturin.outcome == 'failure'
+        run: exit 1
 
       - name: Smoke import
         run: python -c "import rustodbc; print(rustodbc.__version__)"

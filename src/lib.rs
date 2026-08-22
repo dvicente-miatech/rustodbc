@@ -9,6 +9,13 @@
 //! 11, se completa recien cuando la API async este validada contra un IBM i
 //! real -- ver AGENTS.md ss9).
 
+// clippy::useless_conversion: el macro `#[pymethods]` de pyo3 genera
+// conversiones PyErr/PyResult que clippy 1.98 marca como "useless" sobre el
+// return type (`-> PyResult<Self>`). Es un falso positivo del codigo
+// generado por la macro, no de nuestro codigo -- 22+ ocurrencias en
+// metodos pyo3 validos. Silenciado a nivel crate.
+#![allow(clippy::useless_conversion)]
+
 pub mod config;
 pub mod errors;
 

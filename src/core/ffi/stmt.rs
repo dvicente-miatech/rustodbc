@@ -302,7 +302,9 @@ impl RawStatement {
     /// `Vec` hasta que `execute()` retorne.
     ///
     /// `param` es 1-based.
-    #[allow(clippy::too_many_arguments)]
+    // Wrapper seguro sobre SQLBindParameter: los punteros se pasan al driver
+    // (que los deref del otro lado), nunca se deref en Rust.
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn bind_input_parameter(
         &self,
         param: u16,

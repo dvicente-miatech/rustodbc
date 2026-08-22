@@ -74,12 +74,13 @@ jobs:
       # Invariante de AGENTS.md ss4: el GIL nunca se sostiene en el hilo
       # bloqueante. Todo `Python::` en src/core/ (el FFI unsafe) es una
       # violacion de esa regla -- esto lo hace mecanico en vez de confiar
-      # en revisiones manuales.
+      # en revisiones manuales. Se ignoran lineas de comentario/doc (//, ///,
+      # //!) -- los comentarios mencionan la regla, el codigo no debe usarla.
       - name: Lint mecanico -- src/core/ nunca debe tocar el GIL
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          if grep -rn "Python::" src/core/ 2>/dev/null; then
+          if grep -rn "Python::" src/core/ --include="*.rs" 2>/dev/null | grep -vE "^\s*[^:]+:[0-9]+:\s*(//|///|//!)" | grep -q "Python::"; then
             echo "::error::src/core/ no debe referenciar Python:: (GIL) -- ver AGENTS.md ss4"
             exit 1
           fi
@@ -144,13 +145,15 @@ jobs:
       - name: pip install maturin
         run: python -m pip install --upgrade pip "maturin>=1.7,<2.0"
 
-      - name: maturin develop --release (captura de errores)
+      # `maturin develop` requiere un virtualenv activo -- en CI no hay.
+      # Se usa `maturin build` + `pip install <wheel>` (estandar para CI).
+      - name: maturin build --release (captura de errores)
         id: maturin
         shell: bash
         continue-on-error: true
         run: |
           set -o pipefail
-          maturin develop --release 2>&1 | tee /tmp/maturin.log
+          maturin build --release 2>&1 | tee /tmp/maturin.log
 
       - name: Subir log de maturin como artifact
         if: always()
@@ -164,8 +167,10 @@ jobs:
         if: steps.maturin.outcome == 'failure'
         run: exit 1
 
-      - name: Smoke import
-        run: python -c "import rustodbc; print(rustodbc.__version__)"
+      - name: Instalar wheel y smoke import
+        run: |
+          pip install --force-reinstall target/wheels/rustodbc-*.whl
+          python -c "import rustodbc; print(rustodbc.__version__)"
 
       # No hay job de integracion contra un IBM i real: requiere un
       # sistema DB2 for i accesible, que no existe en runners de GitHub.

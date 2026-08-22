@@ -76,6 +76,7 @@ fn build_merge_sql(
 /// Ejecuta el MERGE en chunks de `chunk_size` filas, con halve-and-retry de
 /// chunk size contra SQL0101/SQL54001 (memoizado en `limits`). Devuelve
 /// `(rows_affected_total, chunks)`.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_rows(
     lease: &Lease,
     limits: &std::sync::Mutex<StatementLimits>,
@@ -110,6 +111,7 @@ pub fn merge_rows(
 
 /// INSERT simple (sin PK -- ver regla dura de arriba), en los mismos chunks,
 /// con halve-and-retry compartido.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_only_rows(
     lease: &Lease,
     limits: &std::sync::Mutex<StatementLimits>,

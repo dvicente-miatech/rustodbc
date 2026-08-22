@@ -167,7 +167,7 @@ pub(crate) fn execute_chunked_with_limits(
                 if chunk_size <= 1 {
                     return Err(e);
                 }
-                chunk_size = chunk_size / 2;
+                chunk_size /= 2;
                 discovered = Some(chunk_size);
                 continue;
             }

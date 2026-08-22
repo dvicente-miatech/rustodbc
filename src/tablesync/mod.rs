@@ -286,6 +286,7 @@ impl TableSync {
 
 /// Cuerpo compartido del MERGE (async y sync): resuelve PK, degrada a INSERT
 /// sin PK, y ejecuta los chunks (con halve-and-retry de chunk size).
+#[allow(clippy::too_many_arguments)]
 fn merge_report_sync(
     lease: &crate::core::Lease,
     limits: &std::sync::Mutex<crate::core::StatementLimits>,
@@ -350,6 +351,7 @@ fn merge_report_sync(
 /// Lee `select_sql` desde `src_lease` en streaming (lotes de `chunk_size`),
 /// convierte cada lote a `Vec<Vec<ParamValue>>` con las columnas del SELECT y
 /// lo mergea/inserta en `dest_lease`. RAM acotada por lote.
+#[allow(clippy::too_many_arguments)]
 fn transfer_report_sync(
     src_lease: &crate::core::Lease,
     dest_lease: &crate::core::Lease,

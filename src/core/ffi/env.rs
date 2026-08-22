@@ -108,9 +108,8 @@ impl Environment {
 
 impl Drop for Environment {
     fn drop(&mut self) {
-        unsafe {
-            odbc_sys::SQLFreeHandle(HandleType::Env, self.henv as *mut _);
-        }
+        // El retorno es `#[must_use]` (SqlReturn) -- descartar explicito.
+        let _ = unsafe { odbc_sys::SQLFreeHandle(HandleType::Env, self.henv as *mut _) };
     }
 }
 

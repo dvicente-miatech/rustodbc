@@ -371,8 +371,7 @@ impl RawStatement {
 
 impl Drop for RawStatement {
     fn drop(&mut self) {
-        unsafe {
-            SQLFreeHandle(HandleType::Stmt, self.hstmt as *mut _);
-        }
+        // El retorno es `#[must_use]` (SqlReturn) -- descartar explicito.
+        let _ = unsafe { SQLFreeHandle(HandleType::Stmt, self.hstmt as *mut _) };
     }
 }

@@ -153,9 +153,8 @@ impl RawConnection {
 
 impl Drop for RawConnection {
     fn drop(&mut self) {
-        unsafe {
-            SQLDisconnect(self.hdbc);
-            SQLFreeHandle(HandleType::Dbc, self.hdbc as *mut _);
-        }
+        // Los retornos son `#[must_use]` (SqlReturn) -- descartar explicito.
+        let _ = unsafe { SQLDisconnect(self.hdbc) };
+        let _ = unsafe { SQLFreeHandle(HandleType::Dbc, self.hdbc as *mut _) };
     }
 }

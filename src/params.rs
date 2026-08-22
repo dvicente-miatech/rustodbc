@@ -44,8 +44,7 @@ pub fn params_from_python(params: &Bound<'_, PyAny>) -> PyResult<Vec<ParamValue>
 
     let py = params.py();
 
-    if let Ok(mapping_check) = params.downcast::<pyo3::types::PyDict>() {
-        let _ = mapping_check;
+    if params.downcast::<pyo3::types::PyDict>().is_ok() {
         return Err(to_py_err(CoreError::Parameter(
             "parametros con nombre (dict) no soportados en execute/fetch* -- solo secuencias \
              posicionales (list/tuple) para los marcadores '?'. call_proc admite dict."

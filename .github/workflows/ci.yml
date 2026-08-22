@@ -27,16 +27,34 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Un solo paso para que el fmt NO tape los errores de clippy/compilacion:
-      # se corre fmt (ignorando su salida), despues clippy (que reporta los
-      # errores de compilacion), y al final fmt de nuevo como gatekeeper.
-      # Asi un run muestra TODOS los problemas, no solo el primero.
-      - name: cargo fmt + clippy
+      # Se captura la salida de clippy en un log y se publica en el step
+      # summary del job (visible via la API de check-runs, sin admin) para
+      # poder leer los errores exactos desde el pipeline de diagnostico.
+      # El gate explicito al final hace que el job siga fallando como antes.
+      - name: cargo fmt + clippy (captura de errores)
+        id: lint
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo fmt --check || true
+          cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.log
+          cargo fmt --check
+
+      - name: Publicar salida de clippy al summary
+        if: always()
         shell: bash
         run: |
-          cargo fmt --check || true
-          cargo clippy --all-targets --all-features -- -D warnings
-          cargo fmt --check
+          {
+            echo "### cargo fmt/clippy"
+            echo '```'
+            tail -c 60000 /tmp/clippy.log 2>/dev/null || echo "(sin salida)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Gate -- lint
+        if: steps.lint.outcome == 'failure'
+        run: exit 1
 
       # Invariante de AGENTS.md ss4: el GIL nunca se sostiene en el hilo
       # bloqueante. Todo `Python::` en src/core/ (el FFI unsafe) es una
@@ -74,11 +92,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      # typecheck rapido (no linkea el cdylib): primera senal de errores de
-      # compilacion sin gastar el build release completo. El build real lo
-      # hace `maturin develop --release` abajo.
-      - name: cargo check --all-targets --all-features
-        run: cargo check --all-targets --all-features
+      - name: cargo check --all-targets --all-features (captura de errores)
+        id: check
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo check --all-targets --all-features 2>&1 | tee /tmp/check.log
+
+      - name: Publicar salida de cargo check al summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### cargo check"
+            echo '```'
+            tail -c 60000 /tmp/check.log 2>/dev/null || echo "(sin salida)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Gate -- check
+        if: steps.check.outcome == 'failure'
+        run: exit 1
 
       - name: pip install maturin
         run: python -m pip install --upgrade pip "maturin>=1.7,<2.0"

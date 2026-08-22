@@ -72,7 +72,7 @@ pub fn column_value_to_py(
 
     match value {
         ColumnValue::Null => Ok(py.None()),
-        ColumnValue::Binary(b) => Ok(PyBytes::new_bound(py, b).into_py(py)),
+        ColumnValue::Binary(b) => Ok(PyBytes::new_bound(py, b).to_object(py)),
         ColumnValue::Text(text) => match family {
             SqlTypeFamily::Decimal => decimal_from_text(py, text, decimal_mode),
             SqlTypeFamily::Integer => match text.trim().parse::<i64>() {
@@ -121,14 +121,14 @@ fn parse_date(py: Python<'_>, text: &str) -> PyResult<PyObject> {
     let t = text.trim();
     let (y, m, d) = split_ymd(t)
         .ok_or_else(|| to_py_err(CoreError::Data(format!("fecha invalida del driver: {t:?}"))))?;
-    Ok(PyDate::new_bound(py, y, m, d)?.into_py(py))
+    Ok(PyDate::new_bound(py, y, m, d)?.to_object(py))
 }
 
 fn parse_time(py: Python<'_>, text: &str) -> PyResult<PyObject> {
     let t = text.trim();
     let (h, mi, s, micro) = split_hms(t)
         .ok_or_else(|| to_py_err(CoreError::Data(format!("hora invalida del driver: {t:?}"))))?;
-    Ok(PyTime::new_bound(py, h, mi, s, micro, None)?.into_py(py))
+    Ok(PyTime::new_bound(py, h, mi, s, micro, None)?.to_object(py))
 }
 
 fn parse_timestamp(py: Python<'_>, text: &str) -> PyResult<PyObject> {
@@ -155,7 +155,7 @@ fn parse_timestamp(py: Python<'_>, text: &str) -> PyResult<PyObject> {
         split_hms(&time_part.replace('.', ":")).unwrap_or((0, 0, 0, 0))
     };
 
-    Ok(PyDateTime::new_bound(py, y, m, d, h, mi, s, micro, None)?.into_py(py))
+    Ok(PyDateTime::new_bound(py, y, m, d, h, mi, s, micro, None)?.to_object(py))
 }
 
 fn split_ymd(s: &str) -> Option<(i32, u8, u8)> {

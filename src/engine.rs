@@ -256,7 +256,7 @@ impl Db2iEngine {
         let opts_for_future = options.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let engine = connect_impl(dsn, opts_for_future).await?;
+            let engine = connect_impl(dsn, opts_for_future.clone()).await?;
 
             Python::with_gil(|py| {
                 Py::new(

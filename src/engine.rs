@@ -7,6 +7,11 @@
 //! mientras se tenia el GIL) y se re-adquiere recien al construir el
 //! resultado Python del otro lado. Regla dura de AGENTS.md ss4: el GIL nunca
 //! se sostiene en el hilo bloqueante.
+//!
+//! Los cuerpos async de cada operacion estan en las funciones libres
+//! `*_impl` de abajo, reutilizadas por `Db2iEngine` (via `future_into_py`)
+//! y por `crate::blocking::BlockingEngine` (via `runtime.block_on`) -- una
+//! sola implementacion, dos frontends (async/sync).
 
 use std::sync::Arc;
 
@@ -21,7 +26,7 @@ use crate::params::params_from_python;
 use crate::rows::{batch_to_pylist, column_value_to_py};
 use crate::stream::BatchStream;
 
-fn resolve_driver(explicit: Option<&str>) -> PyResult<String> {
+pub(crate) fn resolve_driver(explicit: Option<&str>) -> PyResult<String> {
     if let Some(d) = explicit {
         return Ok(d.to_string());
     }
@@ -35,7 +40,7 @@ fn resolve_driver(explicit: Option<&str>) -> PyResult<String> {
     Ok(crate::config::DEFAULT_DRIVER_FALLBACK.to_string())
 }
 
-fn resolve_dsn(credentials: &Credentials) -> PyResult<SecretString> {
+pub(crate) fn resolve_dsn(credentials: &Credentials) -> PyResult<SecretString> {
     if credentials.raw_dsn.is_some() {
         // build_dsn ignora el driver resuelto cuando hay raw_dsn -- no hace
         // falta ni vale la pena probar drivers instalados en este camino.
@@ -45,10 +50,201 @@ fn resolve_dsn(credentials: &Credentials) -> PyResult<SecretString> {
     Ok(credentials.build_dsn(&driver))
 }
 
+// ---------------------------------------------------------------------------
+// Cuerpos async compartidos (async frontend -> future_into_py; blocking ->
+// runtime.block_on)
+// ---------------------------------------------------------------------------
+
+/// Crea un `Engine` (pool) de forma async, dentro de `spawn_blocking`.
+pub(crate) async fn connect_impl(
+    dsn: SecretString,
+    options: &EngineOptions,
+) -> PyResult<core::Engine> {
+    let pool_size = options.pool_size;
+    let login_timeout = options.login_timeout;
+    tokio::task::spawn_blocking(move || core::Engine::connect(dsn, pool_size, login_timeout))
+        .await
+        .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
+        .map_err(to_py_err)
+}
+
+async fn run_blocking<T, F>(engine: &SharedEngine, f: F) -> PyResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&core::Lease) -> Result<T, crate::errors::CoreError> + Send + 'static,
+{
+    // Adquirir el lease es async (puede implicar crear una conexion nueva,
+    // que a su vez hace su propio spawn_blocking dentro de
+    // `ConnManager::create`) -- se espera aca, en la tarea async normal,
+    // NUNCA dentro de un `spawn_blocking` (evita bloquear un hilo del pool
+    // de blocking esperando a otro spawn_blocking anidado).
+    let lease = engine.acquire().await.map_err(to_py_err)?;
+
+    // El trabajo ODBC propiamente dicho (la llamada bloqueante real) si
+    // corre en `spawn_blocking`, con el GIL ya liberado del lado de Python
+    // desde que `future_into_py` entrego el control a este future.
+    tokio::task::spawn_blocking(move || f(&lease).map_err(to_py_err))
+        .await
+        .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
+}
+
+pub(crate) async fn execute_impl(
+    engine: &SharedEngine,
+    sql: String,
+    params: Vec<ParamValue>,
+) -> PyResult<i64> {
+    run_blocking(&engine, move |lease| lease.execute(&sql, &params)).await
+}
+
+pub(crate) async fn fetch_all_impl(
+    engine: &SharedEngine,
+    options: &EngineOptions,
+    sql: String,
+    params: Vec<ParamValue>,
+) -> PyResult<Py<PyList>> {
+    let (columns, rows) = run_blocking(&engine, move |lease| lease.query(&sql, &params)).await?;
+    Python::with_gil(|py| {
+        batch_to_pylist(
+            py,
+            &columns,
+            &rows,
+            options.strip_char_padding,
+            &options.decimal_mode,
+        )
+    })
+}
+
+pub(crate) async fn fetch_one_impl(
+    engine: &SharedEngine,
+    options: &EngineOptions,
+    sql: String,
+    params: Vec<ParamValue>,
+) -> PyResult<PyObject> {
+    let (columns, rows) = run_blocking(&engine, move |lease| lease.query(&sql, &params)).await?;
+    Python::with_gil(|py| -> PyResult<PyObject> {
+        if rows.is_empty() {
+            return Ok(py.None());
+        }
+        let list = batch_to_pylist(
+            py,
+            &columns,
+            &rows[..1],
+            options.strip_char_padding,
+            &options.decimal_mode,
+        )?;
+        let list_bound = list.bind(py);
+        Ok(list_bound.get_item(0)?.unbind())
+    })
+}
+
+pub(crate) async fn fetch_value_impl(
+    engine: &SharedEngine,
+    options: &EngineOptions,
+    sql: String,
+    params: Vec<ParamValue>,
+) -> PyResult<PyObject> {
+    let (columns, rows) = run_blocking(&engine, move |lease| lease.query(&sql, &params)).await?;
+    Python::with_gil(|py| -> PyResult<PyObject> {
+        let (Some(row), Some(meta)) = (rows.first(), columns.first()) else {
+            return Ok(py.None());
+        };
+        let value = row.first().unwrap_or(&ColumnValue::Null);
+        column_value_to_py(
+            py,
+            meta,
+            value,
+            options.strip_char_padding,
+            &options.decimal_mode,
+        )
+    })
+}
+
+pub(crate) async fn fetch_column_impl(
+    engine: &SharedEngine,
+    options: &EngineOptions,
+    sql: String,
+    params: Vec<ParamValue>,
+) -> PyResult<Py<PyList>> {
+    let (columns, rows) = run_blocking(&engine, move |lease| lease.query(&sql, &params)).await?;
+    Python::with_gil(|py| -> PyResult<Py<PyList>> {
+        let out = PyList::empty_bound(py);
+        if let Some(meta) = columns.first() {
+            for row in &rows {
+                let value = row.first().unwrap_or(&ColumnValue::Null);
+                let py_value = column_value_to_py(
+                    py,
+                    meta,
+                    value,
+                    options.strip_char_padding,
+                    &options.decimal_mode,
+                )?;
+                out.append(py_value)?;
+            }
+        }
+        Ok(out.unbind())
+    })
+}
+
+/// Ejecuta una consulta en modo streaming: adquiere un lease y devuelve un
+/// `(Lease, RowCursor)` listo para `BatchStream`/`BlockingBatchStream`.
+pub(crate) async fn query_cursor_impl(
+    engine: &SharedEngine,
+    sql: String,
+    params: Vec<ParamValue>,
+) -> PyResult<(core::Lease, core::RowCursor)> {
+    let lease = engine.acquire().await.map_err(to_py_err)?;
+    tokio::task::spawn_blocking(move || match lease.query_cursor(&sql, &params) {
+        Ok(cursor) => Ok((lease, cursor)),
+        Err(e) => Err(e),
+    })
+    .await
+    .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
+    .map_err(to_py_err)
+}
+
+pub(crate) async fn executebatch_impl(
+    engine: &SharedEngine,
+    sql: String,
+    rows: Vec<Vec<ParamValue>>,
+    chunk_size: usize,
+) -> PyResult<crate::bulk::BulkReport> {
+    tokio::task::spawn_blocking(move || {
+        crate::bulk::executebatch_core(&engine, &sql, rows, chunk_size)
+    })
+    .await
+    .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
+    .map_err(to_py_err)
+}
+
+pub(crate) async fn call_proc_impl(
+    engine: &SharedEngine,
+    schema: String,
+    proc: String,
+    params: Py<PyAny>,
+    strip_char_padding: bool,
+    decimal_mode: String,
+) -> PyResult<Py<crate::proc::ProcResult>> {
+    tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            let bound = params.bind(py);
+            crate::proc::call_proc_sync(
+                &engine,
+                &schema,
+                &proc,
+                bound,
+                strip_char_padding,
+                &decimal_mode,
+            )
+        })
+    })
+    .await
+    .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
+}
+
 #[pyclass(module = "rustodbc")]
 pub struct Db2iEngine {
-    engine: SharedEngine,
-    options: EngineOptions,
+    pub(crate) engine: SharedEngine,
+    pub(crate) options: EngineOptions,
 }
 
 impl Db2iEngine {
@@ -57,17 +253,10 @@ impl Db2iEngine {
         dsn: SecretString,
         options: EngineOptions,
     ) -> PyResult<Bound<'_, PyAny>> {
-        let pool_size = options.pool_size;
-        let login_timeout = options.login_timeout;
         let opts_for_future = options.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let engine = tokio::task::spawn_blocking(move || {
-                core::Engine::connect(dsn, pool_size, login_timeout)
-            })
-            .await
-            .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
-            .map_err(to_py_err)?;
+            let engine = connect_impl(dsn, &opts_for_future).await?;
 
             Python::with_gil(|py| {
                 Py::new(
@@ -141,11 +330,7 @@ impl Db2iEngine {
     ) -> PyResult<Bound<'py, PyAny>> {
         let params = convert_params(py, params)?;
         let engine = self.engine.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let rowcount = run_blocking(&engine, move |lease| lease.execute(&sql, &params)).await?;
-            Ok(rowcount)
-        })
+        pyo3_async_runtimes::tokio::future_into_py(py, execute_impl(&engine, sql, params))
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -158,20 +343,10 @@ impl Db2iEngine {
         let params = convert_params(py, params)?;
         let engine = self.engine.clone();
         let options = self.options.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (columns, rows) =
-                run_blocking(&engine, move |lease| lease.query(&sql, &params)).await?;
-            Python::with_gil(|py| {
-                batch_to_pylist(
-                    py,
-                    &columns,
-                    &rows,
-                    options.strip_char_padding,
-                    &options.decimal_mode,
-                )
-            })
-        })
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            fetch_all_impl(&engine, &options, sql, params),
+        )
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -184,25 +359,10 @@ impl Db2iEngine {
         let params = convert_params(py, params)?;
         let engine = self.engine.clone();
         let options = self.options.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (columns, rows) =
-                run_blocking(&engine, move |lease| lease.query(&sql, &params)).await?;
-            Python::with_gil(|py| -> PyResult<PyObject> {
-                if rows.is_empty() {
-                    return Ok(py.None());
-                }
-                let list = batch_to_pylist(
-                    py,
-                    &columns,
-                    &rows[..1],
-                    options.strip_char_padding,
-                    &options.decimal_mode,
-                )?;
-                let list_bound = list.bind(py);
-                Ok(list_bound.get_item(0)?.unbind())
-            })
-        })
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            fetch_one_impl(&engine, &options, sql, params),
+        )
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -215,24 +375,10 @@ impl Db2iEngine {
         let params = convert_params(py, params)?;
         let engine = self.engine.clone();
         let options = self.options.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (columns, rows) =
-                run_blocking(&engine, move |lease| lease.query(&sql, &params)).await?;
-            Python::with_gil(|py| -> PyResult<PyObject> {
-                let (Some(row), Some(meta)) = (rows.first(), columns.first()) else {
-                    return Ok(py.None());
-                };
-                let value = row.first().unwrap_or(&ColumnValue::Null);
-                column_value_to_py(
-                    py,
-                    meta,
-                    value,
-                    options.strip_char_padding,
-                    &options.decimal_mode,
-                )
-            })
-        })
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            fetch_value_impl(&engine, &options, sql, params),
+        )
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -245,28 +391,10 @@ impl Db2iEngine {
         let params = convert_params(py, params)?;
         let engine = self.engine.clone();
         let options = self.options.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (columns, rows) =
-                run_blocking(&engine, move |lease| lease.query(&sql, &params)).await?;
-            Python::with_gil(|py| -> PyResult<Py<PyList>> {
-                let out = PyList::empty_bound(py);
-                if let Some(meta) = columns.first() {
-                    for row in &rows {
-                        let value = row.first().unwrap_or(&ColumnValue::Null);
-                        let py_value = column_value_to_py(
-                            py,
-                            meta,
-                            value,
-                            options.strip_char_padding,
-                            &options.decimal_mode,
-                        )?;
-                        out.append(py_value)?;
-                    }
-                }
-                Ok(out.unbind())
-            })
-        })
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            fetch_column_impl(&engine, &options, sql, params),
+        )
     }
 
     /// Devuelve un `BatchStream` que ejecuta `sql` y va trayendo lotes de
@@ -284,22 +412,16 @@ impl Db2iEngine {
         let engine = self.engine.clone();
         let options = self.options.clone();
         let batch_size = batch_size.unwrap_or(options.stream_batch_size);
+        let prefetch = options.prefetch_batches;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let lease = engine.acquire().await.map_err(to_py_err)?;
-            let (lease, cursor) =
-                tokio::task::spawn_blocking(move || match lease.query_cursor(&sql, &params) {
-                    Ok(cursor) => Ok((lease, cursor)),
-                    Err(e) => Err(e),
-                })
-                .await
-                .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
-                .map_err(to_py_err)?;
-
-            // `BatchStream` sostiene el `Lease` vivo (no vuelve al pool)
-            // mientras el cursor exista -- el `HStmt` del cursor pertenece a
-            // la conexion de ese lease especifico.
-            Python::with_gil(|py| Py::new(py, BatchStream::new(lease, cursor, batch_size, options)))
+            let (lease, cursor) = query_cursor_impl(&engine, sql, params).await?;
+            Python::with_gil(|py| {
+                Py::new(
+                    py,
+                    BatchStream::new(lease, cursor, batch_size, prefetch, options),
+                )
+            })
         })
     }
 
@@ -311,10 +433,8 @@ impl Db2iEngine {
         params: Option<Bound<'py, PyAny>>,
         batch_size: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // `stream()` fila-a-fila es azucar de Python sobre
-        // `stream_batches()` (ver `python/rustodbc/__init__.py`) -- aca solo
-        // delegamos a lo mismo que `stream_batches` porque ambos devuelven
-        // el mismo `BatchStream`; la capa Python decide si aplana los lotes.
+        // `stream()` es lo mismo que `stream_batches()` -- ambos iteran por
+        // lotes de filas (`BatchStream`); ver `.pyi`.
         self.stream_batches(py, sql, params, batch_size)
     }
 
@@ -332,19 +452,14 @@ impl Db2iEngine {
         let rows = crate::bulk::rows_to_param_values(py, &rows)?;
         let engine = self.engine.clone();
         let chunk_size = self.options.batch_size;
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            tokio::task::spawn_blocking(move || {
-                crate::bulk::executebatch_core(&engine, &sql, rows, chunk_size)
-            })
-            .await
-            .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
-            .map_err(to_py_err)
-        })
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            executebatch_impl(&engine, sql, rows, chunk_size),
+        )
     }
 
-    /// `CALL schema.proc(?, ...)` -- ver `proc.rs` para las limitaciones de
-    /// esta primera pasada (solo params posicionales de entrada).
+    /// `CALL schema.proc({nombre: valor})` -- ver `proc.rs` para el detalle
+    /// (dict por nombre + OUT/INOUT devueltos en `ProcResult.out_params`).
     #[pyo3(signature = (schema, proc, params=None))]
     fn call_proc<'py>(
         &self,
@@ -360,24 +475,10 @@ impl Db2iEngine {
         let engine = self.engine.clone();
         let strip = self.options.strip_char_padding;
         let decimal_mode = self.options.decimal_mode.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            tokio::task::spawn_blocking(move || {
-                Python::with_gil(|py| {
-                    let bound = params_owned.bind(py);
-                    crate::proc::call_proc_sync(
-                        &engine,
-                        &schema,
-                        &proc,
-                        bound,
-                        strip,
-                        &decimal_mode,
-                    )
-                })
-            })
-            .await
-            .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
-        })
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            call_proc_impl(&engine, schema, proc, params_owned, strip, decimal_mode),
+        )
     }
 
     /// Devuelve un `TableSync` que hace MERGE/upsert contra este engine
@@ -396,28 +497,9 @@ impl Db2iEngine {
             self.engine.clone(),
             source.map(|s| s.borrow(py).engine.clone()),
             self.options.merge_chunk_size,
+            None,
         )
     }
-}
-
-async fn run_blocking<T, F>(engine: &SharedEngine, f: F) -> PyResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce(&core::Lease) -> Result<T, crate::errors::CoreError> + Send + 'static,
-{
-    // Adquirir el lease es async (puede implicar crear una conexion nueva,
-    // que a su vez hace su propio spawn_blocking dentro de
-    // `ConnManager::create`) -- se espera aca, en la tarea async normal,
-    // NUNCA dentro de un `spawn_blocking` (evita bloquear un hilo del pool
-    // de blocking esperando a otro spawn_blocking anidado).
-    let lease = engine.acquire().await.map_err(to_py_err)?;
-
-    // El trabajo ODBC propiamente dicho (la llamada bloqueante real) si
-    // corre en `spawn_blocking`, con el GIL ya liberado del lado de Python
-    // desde que `future_into_py` entrego el control a este future.
-    tokio::task::spawn_blocking(move || f(&lease).map_err(to_py_err))
-        .await
-        .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
 }
 
 fn convert_params(py: Python<'_>, params: Option<Bound<'_, PyAny>>) -> PyResult<Vec<ParamValue>> {

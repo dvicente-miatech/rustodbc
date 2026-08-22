@@ -51,14 +51,23 @@ pub struct TableSync {
     #[allow(dead_code)]
     source: Option<SharedEngine>,
     merge_chunk_size: usize,
+    /// Runtime tokio para `merge_sync` (solo presente en la fachada
+    /// `BlockingEngine`). La fachada async usa `merge()` (awaitable).
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl TableSync {
-    pub fn new(dest: SharedEngine, source: Option<SharedEngine>, merge_chunk_size: usize) -> Self {
+    pub fn new(
+        dest: SharedEngine,
+        source: Option<SharedEngine>,
+        merge_chunk_size: usize,
+        runtime: Option<tokio::runtime::Handle>,
+    ) -> Self {
         TableSync {
             dest,
             source,
             merge_chunk_size,
+            runtime,
         }
     }
 }
@@ -124,61 +133,111 @@ impl TableSync {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let lease = dest.acquire().await.map_err(to_py_err)?;
-            tokio::task::spawn_blocking(move || -> PyResult<MergeReport> {
-                if rows.is_empty() || columns.is_empty() {
-                    return Ok(MergeReport {
-                        rows_affected: 0,
-                        batches: 0,
-                        used_merge: false,
-                        warning: Some("merge(): records vacio, nada para hacer".to_string()),
-                    });
-                }
-
-                let pk_columns = match primary_key {
-                    Some(pk) => pk,
-                    None => {
-                        catalog::primary_key_columns(&lease, &schema, &table).map_err(to_py_err)?
-                    }
-                };
-
-                if pk_columns.is_empty() {
-                    // Regla dura AGENTS.md ss4: sin PK, INSERT con warning,
-                    // nunca crash y nunca MERGE silencioso sin clave.
-                    let (rows_affected, batches) = merge::insert_only_rows(
-                        &lease, &schema, &table, &columns, &rows, chunk_size,
-                    )
-                    .map_err(to_py_err)?;
-                    return Ok(MergeReport {
-                        rows_affected,
-                        batches,
-                        used_merge: false,
-                        warning: Some(format!(
-                            "{schema}.{table} no tiene PK/indice unico en el catalogo -- se \
-                             hizo INSERT simple, no MERGE"
-                        )),
-                    });
-                }
-
-                let (rows_affected, batches) = merge::merge_rows(
+            tokio::task::spawn_blocking(move || {
+                merge_report_sync(
                     &lease,
                     &schema,
                     &table,
-                    &pk_columns,
                     &columns,
                     &rows,
                     chunk_size,
+                    primary_key,
                 )
-                .map_err(to_py_err)?;
-
-                Ok(MergeReport {
-                    rows_affected,
-                    batches,
-                    used_merge: true,
-                    warning: None,
-                })
             })
             .await
             .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
         })
     }
+
+    /// Variante sincrona del MERGE (fachada `BlockingEngine`). Requiere que
+    /// el `TableSync` se haya creado con un runtime tokio (via
+    /// `BlockingEngine.table_sync()`); si no, `InterfaceError`.
+    #[pyo3(signature = (schema, table, records, primary_key=None))]
+    fn merge_sync(
+        &self,
+        py: Python<'_>,
+        schema: String,
+        table: String,
+        records: Bound<'_, PyAny>,
+        primary_key: Option<Vec<String>>,
+    ) -> PyResult<MergeReport> {
+        let (columns, rows) = records_to_columns_and_rows(py, &records)?;
+        let runtime = self.runtime.clone().ok_or_else(|| {
+            to_py_err(crate::errors::CoreError::Interface(
+                "merge_sync solo esta disponible via BlockingEngine.table_sync()".to_string(),
+            ))
+        })?;
+        let dest = self.dest.clone();
+        let chunk_size = self.merge_chunk_size;
+
+        py.allow_threads(move || {
+            let lease = runtime
+                .block_on(async move { dest.acquire().await })
+                .map_err(to_py_err)?;
+            merge_report_sync(
+                &lease,
+                &schema,
+                &table,
+                &columns,
+                &rows,
+                chunk_size,
+                primary_key,
+            )
+            .map_err(to_py_err)
+        })
+    }
+}
+
+/// Cuerpo compartido del MERGE (async y sync): resuelve PK, degrada a INSERT
+/// sin PK, y ejecuta los chunks.
+fn merge_report_sync(
+    lease: &crate::core::Lease,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<ParamValue>],
+    chunk_size: usize,
+    primary_key: Option<Vec<String>>,
+) -> PyResult<MergeReport> {
+    if rows.is_empty() || columns.is_empty() {
+        return Ok(MergeReport {
+            rows_affected: 0,
+            batches: 0,
+            used_merge: false,
+            warning: Some("merge(): records vacio, nada para hacer".to_string()),
+        });
+    }
+
+    let pk_columns = match primary_key {
+        Some(pk) => pk,
+        None => catalog::primary_key_columns(lease, schema, table).map_err(to_py_err)?,
+    };
+
+    if pk_columns.is_empty() {
+        // Regla dura AGENTS.md ss4: sin PK, INSERT con warning,
+        // nunca crash y nunca MERGE silencioso sin clave.
+        let (rows_affected, batches) =
+            merge::insert_only_rows(lease, schema, table, columns, rows, chunk_size)
+                .map_err(to_py_err)?;
+        return Ok(MergeReport {
+            rows_affected,
+            batches,
+            used_merge: false,
+            warning: Some(format!(
+                "{schema}.{table} no tiene PK/indice unico en el catalogo -- se hizo INSERT \
+                 simple, no MERGE"
+            )),
+        });
+    }
+
+    let (rows_affected, batches) =
+        merge::merge_rows(lease, schema, table, &pk_columns, columns, rows, chunk_size)
+            .map_err(to_py_err)?;
+
+    Ok(MergeReport {
+        rows_affected,
+        batches,
+        used_merge: true,
+        warning: None,
+    })
 }

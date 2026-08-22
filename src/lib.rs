@@ -52,6 +52,8 @@ fn rustodbc_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<engine::Db2iEngine>()?;
     m.add_class::<stream::BatchStream>()?;
+    m.add_class::<blocking::BlockingEngine>()?;
+    m.add_class::<blocking::BlockingBatchStream>()?;
 
     m.add_class::<bulk::BulkReport>()?;
     m.add_class::<bulk::TaskFailure>()?;

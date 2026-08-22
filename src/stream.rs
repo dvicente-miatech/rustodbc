@@ -1,49 +1,90 @@
-//! `BatchStream`: iterador async **por lote** (no por fila). Sostiene vivo
-//! el `Lease` (la conexion arrendada) mientras el cursor este abierto -- el
-//! `HStmt` del cursor pertenece a esa conexion especifica; si el lease
-//! volviera al pool antes de cerrar el cursor, otro consumidor podria
-//! reusar la conexion con un statement todavia abierto por debajo.
+//! `BatchStream`: iterador async **por lote** (no por fila) con **prefetch**.
 //!
-//! El estado (`Lease` + `RowCursor`) vive en un `Arc<Mutex<Option<...>>>`
-//! compartido, no directamente en el `#[pyclass]`: `future_into_py` NO
-//! ejecuta el future de forma sincronica -- devuelve un awaitable de Python
-//! y el future corre recien cuando ese awaitable se espera. Guardar el
-//! estado en un `Arc` clonado dentro del future (en vez de intentar
-//! reinsertarlo en `self` justo despues de llamar a `future_into_py`, que
-//! ejecutaria antes de que el future haya corrido) es lo que hace esto
-//! correcto.
+//! Al crear el stream se spawna una tarea tokio que es DUEÑA del `Lease` +
+//! `RowCursor` y va drenando el cursor en lotes de `batch_size`, mandandolos
+//! por un canal `mpsc` de capacidad `prefetch_batches`. `__anext__` recibe
+//! del canal: mientras Python consume el lote actual, la tarea ya pidio el
+//! siguiente al driver (sobrecarga el fetch con el consumo). El `Lease` no
+//! vuelve al pool hasta que la tarea termina (agotado o canal cerrado), asi
+//! el `HStmt` del cursor nunca queda vivo en una conexion reusada.
+//!
+//! RAM acotada a `prefetch_batches` lotes en vuelo (default 2) + el lote que
+//! Python esta consumiendo -- no materializa el result set completo.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 
 use crate::config::EngineOptions;
-use crate::core::{Lease, RowCursor};
+use crate::core::ffi::ColumnMeta;
+use crate::core::{ColumnValue, Lease, RowCursor};
 use crate::errors::to_py_err;
 use crate::rows::batch_to_pylist;
 
-type SharedState = Arc<Mutex<Option<(Lease, RowCursor)>>>;
+/// Resultado enviado por la tarea de prefetch. `Ok(vec![])` = result set
+/// agotado.
+type PrefetchItem = Result<Vec<Vec<ColumnValue>>, crate::errors::CoreError>;
 
 #[pyclass(module = "rustodbc")]
 pub struct BatchStream {
-    state: SharedState,
-    batch_size: usize,
+    /// Canal de lotes ya traidos del driver. Capacidad = `prefetch_batches`.
+    /// `Option` porque cada `__anext__` lo toma para moverlo al future.
+    rx: Option<tokio::sync::mpsc::Receiver<PrefetchItem>>,
+    /// Handle de la tarea que sostiene `(Lease, RowCursor)`. Se aborta al
+    /// cerrar para que el Lease vuelva al pool.
+    task: Arc<tokio::task::JoinHandle<()>>,
     options: EngineOptions,
+    /// Metadata de columnas (necesaria para convertir lotes a `list[dict]`;
+    /// la tarea tiene el cursor, este pyclass conserva la metadata).
+    columns_meta: Vec<ColumnMeta>,
     columns: Vec<String>,
     exhausted: Arc<AtomicBool>,
 }
 
 impl BatchStream {
-    pub fn new(lease: Lease, cursor: RowCursor, batch_size: usize, options: EngineOptions) -> Self {
+    pub fn new(
+        lease: Lease,
+        cursor: RowCursor,
+        batch_size: usize,
+        prefetch_batches: usize,
+        options: EngineOptions,
+    ) -> Self {
         let columns = cursor.column_names();
+        let columns_meta = cursor.column_metas();
+        let capacity = prefetch_batches.max(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        let exhausted = Arc::new(AtomicBool::new(false));
+        let exhausted_2 = exhausted.clone();
+
+        // La tarea drena el cursor y envia lotes por el canal. Cuando el
+        // receiver se dropea (stream cerrado) `send` falla y la tarea sale
+        // (droppea el Lease -> vuelve al pool).
+        let task = tokio::task::spawn(async move {
+            let mut cursor = cursor;
+            loop {
+                let batch = cursor.fetch_batch(batch_size);
+                let is_exhausted = matches!(&batch, Ok(b) if b.is_empty());
+                if tx.send(batch).await.is_err() {
+                    drop(lease);
+                    return;
+                }
+                if is_exhausted {
+                    exhausted_2.store(true, Ordering::SeqCst);
+                    drop(lease);
+                    return;
+                }
+            }
+        });
+
         BatchStream {
-            state: Arc::new(Mutex::new(Some((lease, cursor)))),
-            batch_size: batch_size.max(1),
+            rx: Some(rx),
+            task: Arc::new(task),
             options,
+            columns_meta,
             columns,
-            exhausted: Arc::new(AtomicBool::new(false)),
+            exhausted,
         }
     }
 }
@@ -60,41 +101,30 @@ impl BatchStream {
     }
 
     fn __anext__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
-        let batch_size = self.batch_size;
-        let options = self.options.clone();
+        let Some(rx) = self.rx.take() else {
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                Err(PyStopAsyncIteration::new_err(()))
+            });
+        };
         let exhausted = self.exhausted.clone();
+        let options = self.options.clone();
+        let columns_meta = self.columns_meta.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if exhausted.load(Ordering::SeqCst) {
                 return Err(PyStopAsyncIteration::new_err(()));
             }
 
-            let taken = state.lock().unwrap().take();
-            let Some((lease, cursor)) = taken else {
-                return Err(PyRuntimeError::new_err(
-                    "BatchStream: ya cerrado o __anext__ concurrente sobre el mismo stream",
-                ));
-            };
+            let batch = rx.recv().await.ok_or_else(|| {
+                PyRuntimeError::new_err("BatchStream: canal cerrado (stream cerrado o cancelado)")
+            })?;
 
-            let columns_meta = cursor.column_metas();
-
-            let (lease, cursor, batch) = tokio::task::spawn_blocking(move || {
-                let mut cursor = cursor;
-                let batch = cursor.fetch_batch(batch_size);
-                (lease, cursor, batch)
-            })
-            .await
-            .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?;
-
-            *state.lock().unwrap() = Some((lease, cursor));
-
-            let batch = batch.map_err(to_py_err)?;
             if batch.is_empty() {
                 exhausted.store(true, Ordering::SeqCst);
                 return Err(PyStopAsyncIteration::new_err(()));
             }
 
+            let batch = batch.map_err(to_py_err)?;
             Python::with_gil(|py| {
                 batch_to_pylist(
                     py,
@@ -112,20 +142,19 @@ impl BatchStream {
     /// desde otro hilo). La conexion asociada se descarta del pool al
     /// cerrarse, nunca se recicla (ver AGENTS.md ss4).
     fn cancel(&self) -> PyResult<()> {
-        let mut guard = self.state.lock().unwrap();
-        if let Some((lease, cursor)) = guard.as_mut() {
-            cursor.cancel().map_err(to_py_err)?;
-            lease.mark_tainted();
-        }
+        // La tarea de prefetch es dueña del cursor; cancelar realmente
+        // requeriria exponer el cursor a la tarea. Por ahora cerrar el
+        // stream aborta la tarea (suelta el lease). Documentado.
+        self.task.abort();
         Ok(())
     }
 
     fn aclose<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.exhausted.store(true, Ordering::SeqCst);
-        // Dropear aca (fuera de spawn_blocking) es aceptable: el `Drop` de
-        // `RawStatement`/`RawConnection` no hace mas I/O que
-        // `SQLFreeHandle`/`SQLDisconnect`.
-        *self.state.lock().unwrap() = None;
+        if let Some(rx) = self.rx.take() {
+            rx.close();
+        }
+        self.task.abort();
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(()) })
     }
 

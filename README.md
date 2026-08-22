@@ -6,10 +6,10 @@ extensión de Python (PyO3 + maturin).
 Ver [AGENTS.md](AGENTS.md) para el diseño completo y el estado real de cada
 módulo.
 
-> **Estado del proyecto:** la API async está implementada y el CI es verde
+> **Estado del proyecto:** API **async** (`Db2iEngine`) y **síncrona**
+> (`BlockingEngine` vía `rustodbc.blocking`) implementadas, CI verde
 > (`cargo fmt` + `clippy -D warnings` + build + smoke import en Windows y
-> Linux). La fachada síncrona `BlockingEngine` (`rustodbc.blocking`) sigue
-> como stub deliberado (Fase 11 del plan) — la API real hoy es async.
+> Linux). Streaming con prefetch en ambas.
 
 ## Instalación
 
@@ -240,7 +240,10 @@ async def main():
         total = await engine.fetch_value("SELECT COUNT(*) FROM SCHEMA.TABLA")
         ids = await engine.fetch_column("SELECT id FROM SCHEMA.TABLA")
 
-        # streaming por lotes (no carga todo en memoria) -> list[Row] por batch
+        # streaming por lotes (no carga todo en memoria) -> list[Row] por batch.
+        # Prefetch: mientras consumís un lote, la tarea ya pidió el siguiente
+        # (EngineOptions.prefetch_batches, default 2) -- RAM acotada a unos
+        # pocos lotes, no a toda la tabla.
         async for batch in engine.stream_batches("SELECT * FROM SCHEMA.HUGE_TABLE", batch_size=5000):
             for r in batch:
                 ...
@@ -290,9 +293,14 @@ print(report.rows_affected, report.batches)
 
 ### Procedimientos (`call_proc`)
 
+Recibe un **dict** `{nombre_parametro: valor}`. Los parámetros **OUT no
+necesitan venir** en el dict — se bindean como NULL de entrada y el
+procedimiento igual se ejecuta; el resultado sale en `out_params`:
+
 ```python
-result = await engine.call_proc("SCHEMA", "MI_PROC", [1, "parametro"])
+result = await engine.call_proc("SCHEMA", "MI_PROC", {"IN_PARAM": 5})
 # result.result_sets -> list[list[Row]]
+# result.out_params  -> {"OUT_PARAM": <valor>, ...}  # OUT/INOUT
 ```
 
 ### MERGE/upsert (`TableSync`)
@@ -316,6 +324,9 @@ print(report.used_merge, report.rows_affected, report.warning)
 Sin PK → hace INSERT simple con `warning` (nunca crashea ni hace MERGE
 silencioso — regla dura de AGENTS.md ss4).
 
+En la fachada síncrona (`BlockingEngine`), usá `merge_sync` (mismo
+comportamiento, síncrono):
+
 ### Errores comunes
 
 - **`no running event loop`** al conectar/consultar: usaste dos `asyncio.run()`
@@ -327,11 +338,40 @@ silencioso — regla dura de AGENTS.md ss4).
 
 ## Síncrono (`BlockingEngine`)
 
-La fachada síncrona **todavía no está implementada** (Fase 11 del plan, a
-propósito: se hace como proyección delgada sobre la API async ya estable, no
-como una segunda implementación). Hoy `rustodbc.blocking` levanta
-`NotImplementedError`. Mientras tanto, el patrón para código síncrono es
-envolver en `asyncio.run()` (ver arriba) o mantener la API async.
+Fachada síncrona en Rust (no un wrapper de `asyncio.run`): misma API que
+`Db2iEngine` pero bloqueante, con un runtime tokio propio. Pensada para
+call-sites que hoy envuelven `ISeriesConnection` en `asyncio.to_thread(...)`
+desde código síncrono (crons de arq, parsers).
+
+```python
+from rustodbc.blocking import BlockingEngine
+
+engine = BlockingEngine.from_env("ACME", "PROD")   # o .connect(creds)
+rows = engine.fetch_all("SELECT * FROM SCHEMA.TABLA WHERE id = ?", [123])
+report = engine.executebatch("INSERT INTO T (a) VALUES (?)", [[1], [2]])
+result = engine.call_proc("SCHEMA", "MI_PROC", {"IN": 1})
+engine.close()
+```
+
+**Streaming síncrono** (reemplaza `iter_dict_chunks`):
+
+```python
+for batch in engine.stream("SELECT * FROM SCHEMA.HUGE_TABLE", batch_size=5000):
+    for row in batch:
+        ...
+```
+
+**MERGE síncrono:**
+
+```python
+sync = engine.table_sync()
+report = sync.merge_sync("SCHEMA", "TABLA", [{"ID": 1, "VALOR": "a"}])
+```
+
+**Regla importante:** `BlockingEngine` levanta `InterfaceError` si se llama
+desde un hilo con un **event loop de asyncio corriendo** — para que nadie
+termine bloqueando el loop de arq. Si estás dentro de un loop, usá la API
+async (`Db2iEngine`).
 
 ---
 

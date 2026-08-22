@@ -42,10 +42,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml pyproject.toml
-          git commit -m "Bump version to ${{ inputs.version }}"
-          git tag v${{ inputs.version }}
-          git push origin v${{ inputs.version }}
-          git push
+          # Si la version ya era la pedida (release repetido), no hay nada que
+          # commitear -- el commit no debe fallar por eso.
+          if git diff --cached --quiet; then
+            echo "No hay cambios que commitear (la version ya es ${{ inputs.version }})."
+          else
+            git commit -m "Bump version to ${{ inputs.version }}"
+            git push
+          fi
+          git tag -f v${{ inputs.version }}
+          # -f: si un run anterior fallo a mitad (tag local creado sin push), el
+          # re-run recrea el tag apuntando al HEAD correcto.
+          git push -f origin v${{ inputs.version }}
 
   build_sdist:
     name: Build sdist

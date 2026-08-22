@@ -31,21 +31,27 @@ create_exception!(rustodbc, FeatureUnavailable, RustOdbcError);
 
 /// Registra el arbol completo de excepciones en el modulo `#[pymodule]`.
 pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("RustOdbcError", py.get_type::<RustOdbcError>())?;
-    m.add("ConfigurationError", py.get_type::<ConfigurationError>())?;
-    m.add("ConnectError", py.get_type::<ConnectError>())?;
-    m.add("PoolTimeout", py.get_type::<PoolTimeout>())?;
-    m.add("InterfaceError", py.get_type::<InterfaceError>())?;
-    m.add("QueryError", py.get_type::<QueryError>())?;
-    m.add("SqlSyntaxError", py.get_type::<SqlSyntaxError>())?;
-    m.add("IntegrityError", py.get_type::<IntegrityError>())?;
-    m.add("DataError", py.get_type::<DataError>())?;
-    m.add("OperationTimeout", py.get_type::<OperationTimeout>())?;
-    m.add("ParameterError", py.get_type::<ParameterError>())?;
-    m.add("BulkFailure", py.get_type::<BulkFailure>())?;
-    m.add("MergeFailure", py.get_type::<MergeFailure>())?;
-    m.add("CatalogError", py.get_type::<CatalogError>())?;
-    m.add("FeatureUnavailable", py.get_type::<FeatureUnavailable>())?;
+    m.add("RustOdbcError", py.get_type_bound::<RustOdbcError>())?;
+    m.add(
+        "ConfigurationError",
+        py.get_type_bound::<ConfigurationError>(),
+    )?;
+    m.add("ConnectError", py.get_type_bound::<ConnectError>())?;
+    m.add("PoolTimeout", py.get_type_bound::<PoolTimeout>())?;
+    m.add("InterfaceError", py.get_type_bound::<InterfaceError>())?;
+    m.add("QueryError", py.get_type_bound::<QueryError>())?;
+    m.add("SqlSyntaxError", py.get_type_bound::<SqlSyntaxError>())?;
+    m.add("IntegrityError", py.get_type_bound::<IntegrityError>())?;
+    m.add("DataError", py.get_type_bound::<DataError>())?;
+    m.add("OperationTimeout", py.get_type_bound::<OperationTimeout>())?;
+    m.add("ParameterError", py.get_type_bound::<ParameterError>())?;
+    m.add("BulkFailure", py.get_type_bound::<BulkFailure>())?;
+    m.add("MergeFailure", py.get_type_bound::<MergeFailure>())?;
+    m.add("CatalogError", py.get_type_bound::<CatalogError>())?;
+    m.add(
+        "FeatureUnavailable",
+        py.get_type_bound::<FeatureUnavailable>(),
+    )?;
     Ok(())
 }
 

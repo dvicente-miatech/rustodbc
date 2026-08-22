@@ -56,9 +56,8 @@ jobs:
           LOG=$(tail -c 60000 /tmp/clippy.log 2>/dev/null || echo "(sin log)")
           JOB_ID=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs" --jq ".jobs[] | select(.name == env.JOB_NAME) | .id" | head -1)
           echo "JOB_ID=$JOB_ID"
-          gh api -X PATCH "repos/${{ github.repository }}/check-runs/$JOB_ID" \
-            -f "output[title]=clippy log" \
-            -f "output[text]=$LOG" 2>&1 | head -5 || true
+          jq -n --arg t "clippy log" --arg text "$LOG" '{output:{title:$t,text:$text}}' > /tmp/payload.json
+          gh api -X PATCH "repos/${{ github.repository }}/check-runs/$JOB_ID" --input /tmp/payload.json 2>&1 | head -5 || true
 
       - name: Subir log completo como artifact
         if: always()
@@ -127,9 +126,8 @@ jobs:
           LOG=$(tail -c 60000 /tmp/check.log 2>/dev/null || echo "(sin log)")
           JOB_ID=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs" --jq ".jobs[] | select(.name == env.JOB_NAME) | .id" | head -1)
           echo "JOB_ID=$JOB_ID"
-          gh api -X PATCH "repos/${{ github.repository }}/check-runs/$JOB_ID" \
-            -f "output[title]=cargo check log" \
-            -f "output[text]=$LOG" 2>&1 | head -5 || true
+          jq -n --arg t "cargo check log" --arg text "$LOG" '{output:{title:$t,text:$text}}' > /tmp/payload.json
+          gh api -X PATCH "repos/${{ github.repository }}/check-runs/$JOB_ID" --input /tmp/payload.json 2>&1 | head -5 || true
 
       - name: Subir log completo como artifact
         if: always()

@@ -17,7 +17,7 @@
 
 use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
-use pyo3::types::{PyBytes, PyDate, PyDateTime, PyDict, PyList, PyString, PyTime};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 use pyo3::{IntoPy, PyObject};
 
 use crate::core::ffi::stmt::{classify_sql_type, SqlTypeFamily};
@@ -33,6 +33,46 @@ fn decimal_ctor(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
         Ok(module.getattr("Decimal")?.unbind())
     })?;
     Ok(obj.bind(py))
+}
+
+/// Constructores del modulo `datetime` de Python. NO se usan los tipos
+/// `PyDate`/`PyTime`/`PyDateTime` de pyo3 porque no existen en modo abi3
+/// (pyo3 0.22 los gatea con `#[cfg(not(Py_LIMITED_API))]`) -- se construye
+/// el objeto Python llamando al modulo directamente.
+static DATETIME_MODULE: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
+
+fn datetime_module(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    let obj = DATETIME_MODULE.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        let module = py.import_bound("datetime")?;
+        Ok(module.unbind())
+    })?;
+    Ok(obj.bind(py))
+}
+
+fn make_date(py: Python<'_>, y: i32, m: u8, d: u8) -> PyResult<PyObject> {
+    let dtmod = datetime_module(py)?;
+    Ok(dtmod.call_method1("date", (y, m, d))?.unbind())
+}
+
+fn make_time(py: Python<'_>, h: u8, mi: u8, s: u8, micro: u32) -> PyResult<PyObject> {
+    let dtmod = datetime_module(py)?;
+    Ok(dtmod.call_method1("time", (h, mi, s, micro))?.unbind())
+}
+
+fn make_datetime(
+    py: Python<'_>,
+    y: i32,
+    m: u8,
+    d: u8,
+    h: u8,
+    mi: u8,
+    s: u8,
+    micro: u32,
+) -> PyResult<PyObject> {
+    let dtmod = datetime_module(py)?;
+    Ok(dtmod
+        .call_method1("datetime", (y, m, d, h, mi, s, micro))?
+        .unbind())
 }
 
 /// Convierte un batch de filas (`Vec<Vec<ColumnValue>>`) a `list[dict]`, con
@@ -121,14 +161,14 @@ fn parse_date(py: Python<'_>, text: &str) -> PyResult<PyObject> {
     let t = text.trim();
     let (y, m, d) = split_ymd(t)
         .ok_or_else(|| to_py_err(CoreError::Data(format!("fecha invalida del driver: {t:?}"))))?;
-    Ok(PyDate::new_bound(py, y, m, d)?.to_object(py))
+    make_date(py, y, m, d)
 }
 
 fn parse_time(py: Python<'_>, text: &str) -> PyResult<PyObject> {
     let t = text.trim();
     let (h, mi, s, micro) = split_hms(t)
         .ok_or_else(|| to_py_err(CoreError::Data(format!("hora invalida del driver: {t:?}"))))?;
-    Ok(PyTime::new_bound(py, h, mi, s, micro, None)?.to_object(py))
+    make_time(py, h, mi, s, micro)
 }
 
 fn parse_timestamp(py: Python<'_>, text: &str) -> PyResult<PyObject> {
@@ -155,7 +195,7 @@ fn parse_timestamp(py: Python<'_>, text: &str) -> PyResult<PyObject> {
         split_hms(&time_part.replace('.', ":")).unwrap_or((0, 0, 0, 0))
     };
 
-    Ok(PyDateTime::new_bound(py, y, m, d, h, mi, s, micro, None)?.to_object(py))
+    Ok(make_datetime(py, y, m, d, h, mi, s, micro))
 }
 
 fn split_ymd(s: &str) -> Option<(i32, u8, u8)> {

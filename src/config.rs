@@ -85,7 +85,7 @@ impl Credentials {
     /// `connection.py:30-35` para el comportamiento exacto que esto preserva.
     #[staticmethod]
     #[pyo3(signature = (client_code, environment=None))]
-    fn from_env(client_code: &str, environment: Option<&str>) -> PyResult<Self> {
+    pub fn from_env(client_code: &str, environment: Option<&str>) -> PyResult<Self> {
         resolve_from_env(client_code, environment).map_err(to_py_err)
     }
 

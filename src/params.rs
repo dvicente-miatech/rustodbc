@@ -17,7 +17,7 @@
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
-use pyo3::types::{PyBool, PyBoolMethods, PyBytes, PyDate, PyDateTime, PyTime};
+use pyo3::types::{PyBool, PyBoolMethods, PyBytes};
 
 use crate::core::ParamValue;
 use crate::errors::{to_py_err, CoreError};
@@ -28,6 +28,20 @@ fn decimal_type(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     let obj = DECIMAL_TYPE.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
         let module = py.import_bound("decimal")?;
         Ok(module.getattr("Decimal")?.unbind())
+    })?;
+    Ok(obj.bind(py))
+}
+
+/// Clases del modulo `datetime` de Python. NO se usan los tipos
+/// `PyDate`/`PyTime`/`PyDateTime` de pyo3: no existen en modo abi3
+/// (pyo3 0.22 los gatea con `#[cfg(not(Py_LIMITED_API))]`). Se detectan por
+/// `is_instance` contra las clases reales de Python.
+static DATETIME_MODULE: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
+
+fn datetime_module(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    let obj = DATETIME_MODULE.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        let module = py.import_bound("datetime")?;
+        Ok(module.unbind())
     })?;
     Ok(obj.bind(py))
 }
@@ -93,14 +107,18 @@ pub fn param_value_from_python(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyRe
         return Ok(ParamValue::Text(text));
     }
 
-    if let Ok(dt) = value.downcast::<PyDateTime>() {
-        return Ok(ParamValue::Text(format_datetime(dt.as_any())?));
+    // datetime PRIMERO (datetime es subclase de date), despues date, luego
+    // time -- detectados por is_instance contra el modulo datetime real
+    // (pyo3 abi3 no expone tipos de fecha Rust).
+    let dtmod = datetime_module(py)?;
+    if value.is_instance(&dtmod.getattr("datetime")?)? {
+        return Ok(ParamValue::Text(format_datetime(value)?));
     }
-    if let Ok(d) = value.downcast::<PyDate>() {
-        return Ok(ParamValue::Text(format_date(d.as_any())?));
+    if value.is_instance(&dtmod.getattr("date")?)? {
+        return Ok(ParamValue::Text(format_date(value)?));
     }
-    if let Ok(t) = value.downcast::<PyTime>() {
-        return Ok(ParamValue::Text(format_time(t.as_any())?));
+    if value.is_instance(&dtmod.getattr("time")?)? {
+        return Ok(ParamValue::Text(format_time(value)?));
     }
 
     if let Ok(b) = value.downcast::<PyBytes>() {

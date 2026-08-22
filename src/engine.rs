@@ -387,10 +387,14 @@ impl Db2iEngine {
     /// herencia (ver `tablesync/mod.rs`).
     #[cfg(feature = "tablesync")]
     #[pyo3(signature = (source=None))]
-    fn table_sync(&self, source: Option<Py<Db2iEngine>>) -> crate::tablesync::TableSync {
+    fn table_sync<'py>(
+        &self,
+        py: Python<'py>,
+        source: Option<Py<Db2iEngine>>,
+    ) -> crate::tablesync::TableSync {
         crate::tablesync::TableSync::new(
             self.engine.clone(),
-            source.map(|s| s.borrow().engine.clone()),
+            source.map(|s| s.borrow(py).engine.clone()),
             self.options.merge_chunk_size,
         )
     }

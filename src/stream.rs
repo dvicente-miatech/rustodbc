@@ -102,12 +102,9 @@ impl BatchStream {
 
     fn __anext__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let Some(mut rx) = self.rx.take() else {
-            return pyo3_async_runtimes::tokio::future_into_py(
-                py,
-                async move -> PyResult<Py<pyo3::types::PyList>> {
-                    Err(PyStopAsyncIteration::new_err(()))
-                },
-            );
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                Err::<Py<pyo3::types::PyList>, PyErr>(PyStopAsyncIteration::new_err(()))
+            });
         };
         let exhausted = self.exhausted.clone();
         let options = self.options.clone();

@@ -45,7 +45,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          grep -E "^error|^warning|^  -->|^error\[|^warning\[|doesn't|not found|cannot|expected|mismatched" /tmp/clippy.log 2>/dev/null | head -50 | while IFS= read -r line; do
+          grep -E "^error|^warning|^  -->|^error\[|^warning\[|doesn't|not found|cannot|expected|mismatched" /tmp/clippy.log 2>/dev/null | head -200 | while IFS= read -r line; do
             echo "::error::$(echo "$line" | head -c 500)"
           done || true
 
@@ -101,7 +101,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          grep -E "^error|^warning|^  -->|^error\[|^warning\[|doesn't|not found|cannot|expected|mismatched" /tmp/check.log 2>/dev/null | head -50 | while IFS= read -r line; do
+          grep -E "^error|^warning|^  -->|^error\[|^warning\[|doesn't|not found|cannot|expected|mismatched" /tmp/check.log 2>/dev/null | head -200 | while IFS= read -r line; do
             echo "::error::$(echo "$line" | head -c 500)"
           done || true
 

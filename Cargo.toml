@@ -23,6 +23,15 @@ tablesync = []
 # that today has zero consumers (fetch_df had zero call sites in the source).
 arrow = ["dep:arrow", "dep:arrow-array", "dep:arrow-schema"]
 
+# pyo3 0.22 expande `create_exception!` con `#[cfg(feature = "gil-refs")]`
+# (comodidad de GIL-refs que este crate no usa). Como `gil-refs` no es un
+# feature nuestro, rustc lo marcaba como `unexpected_cfgs` (warning, y error
+# bajo clippy -D warnings) una vez por cada excepcion registrada. Se declara
+# como cfg valido para que el lint no se dispare -- NO es un feature que se
+# active, es solo para que el compilador lo conozca.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("gil-refs"))'] }
+
 [dependencies]
 # ---- PyO3 / Python interop ----------------------------------------------
 # abi3-py312: one wheel per platform for 3.12/3.13/3.14+, matching the

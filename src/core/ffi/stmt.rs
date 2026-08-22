@@ -8,10 +8,10 @@
 use std::ptr;
 
 use odbc_sys::{
-    CDataType, HDbc, HStmt, HandleType, Len, Nullability, SQLAllocHandle, SQLBindParameter,
-    SQLCancel, SQLCloseCursor, SQLDescribeColW, SQLExecDirectW, SQLExecute, SQLFetch,
-    SQLFreeHandle, SQLGetData, SQLMoreResults, SQLNumResultCols, SQLPrepareW, SQLRowCount,
-    ParamType, Pointer, SqlDataType, SqlReturn, ULen,
+    CDataType, HDbc, HStmt, HandleType, Len, Nullability, ParamType, Pointer, SQLAllocHandle,
+    SQLBindParameter, SQLCancel, SQLCloseCursor, SQLDescribeColW, SQLExecDirectW, SQLExecute,
+    SQLFetch, SQLFreeHandle, SQLGetData, SQLMoreResults, SQLNumResultCols, SQLPrepareW,
+    SQLRowCount, SqlDataType, SqlReturn, ULen,
 };
 
 use crate::errors::CoreError;
@@ -59,7 +59,10 @@ pub fn classify_sql_type(sql_type: i16) -> SqlTypeFamily {
         {
             SqlTypeFamily::Integer
         }
-        t if t == SqlDataType::FLOAT.0 || t == SqlDataType::REAL.0 || t == SqlDataType::DOUBLE.0 => {
+        t if t == SqlDataType::FLOAT.0
+            || t == SqlDataType::REAL.0
+            || t == SqlDataType::DOUBLE.0 =>
+        {
             SqlTypeFamily::Float
         }
         t if t == SqlDataType::EXT_BIT.0 => SqlTypeFamily::Bit,
@@ -112,8 +115,7 @@ impl RawStatement {
 
     pub fn exec_direct(&self, sql: &str) -> Result<(), CoreError> {
         let sql_u16 = to_utf16(sql);
-        let ret =
-            unsafe { SQLExecDirectW(self.hstmt, sql_u16.as_ptr(), utf16_len(sql) as i32) };
+        let ret = unsafe { SQLExecDirectW(self.hstmt, sql_u16.as_ptr(), utf16_len(sql) as i32) };
         self.check(ret)
     }
 

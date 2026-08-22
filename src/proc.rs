@@ -61,7 +61,9 @@ pub fn call_proc_sync(
     let out = PyList::empty_bound(py);
     for (columns, rows) in &result_sets {
         let list = batch_to_pylist(py, columns, rows, strip_char_padding, decimal_mode)?;
-        out.append(list)?;
+        // `Py<PyList>` -> `PyObject` explicito: `append` no hace coerce de
+        // `Py<T>` a `PyObject` por si solo.
+        out.append(list.into_py(py))?;
     }
 
     Py::new(

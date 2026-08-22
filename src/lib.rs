@@ -12,19 +12,19 @@
 pub mod config;
 pub mod errors;
 
-pub mod core;
-pub mod pool;
-pub mod engine;
-pub mod params;
-pub mod rows;
-pub mod stream;
-pub mod proc;
-pub mod bulk;
-#[cfg(feature = "tablesync")]
-pub mod tablesync;
 #[cfg(feature = "arrow")]
 pub mod arrow;
 pub mod blocking;
+pub mod bulk;
+pub mod core;
+pub mod engine;
+pub mod params;
+pub mod pool;
+pub mod proc;
+pub mod rows;
+pub mod stream;
+#[cfg(feature = "tablesync")]
+pub mod tablesync;
 
 use pyo3::prelude::*;
 

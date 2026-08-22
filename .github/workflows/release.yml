@@ -33,7 +33,7 @@ jobs:
     outputs:
       tag: v${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Actualizar version en Cargo.toml y pyproject.toml
         run: |
@@ -52,7 +52,7 @@ jobs:
     needs: bump_version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.bump_version.outputs.tag }}
 
@@ -75,11 +75,11 @@ jobs:
     needs: bump_version
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.bump_version.outputs.tag }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -99,7 +99,7 @@ jobs:
     needs: bump_version
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.bump_version.outputs.tag }}
 
@@ -133,7 +133,7 @@ jobs:
     needs: bump_version
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.bump_version.outputs.tag }}
 

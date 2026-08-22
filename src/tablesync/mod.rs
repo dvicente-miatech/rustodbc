@@ -136,8 +136,9 @@ impl TableSync {
 
                 let pk_columns = match primary_key {
                     Some(pk) => pk,
-                    None => catalog::primary_key_columns(&lease, &schema, &table)
-                        .map_err(to_py_err)?,
+                    None => {
+                        catalog::primary_key_columns(&lease, &schema, &table).map_err(to_py_err)?
+                    }
                 };
 
                 if pk_columns.is_empty() {
@@ -159,7 +160,13 @@ impl TableSync {
                 }
 
                 let (rows_affected, batches) = merge::merge_rows(
-                    &lease, &schema, &table, &pk_columns, &columns, &rows, chunk_size,
+                    &lease,
+                    &schema,
+                    &table,
+                    &pk_columns,
+                    &columns,
+                    &rows,
+                    chunk_size,
                 )
                 .map_err(to_py_err)?;
 

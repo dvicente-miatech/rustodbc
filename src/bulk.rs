@@ -28,7 +28,11 @@ use crate::params::param_value_from_python;
 /// deliberadamente NO cpu-aware (ver AGENTS.md ss4): es "no abras 4 jobs del
 /// AS/400 para insertar 200 filas", no una heuristica de paralelismo de CPU.
 #[pyfunction]
-pub fn plan_concurrency(total_rows: usize, min_rows_per_worker: usize, max_workers: usize) -> usize {
+pub fn plan_concurrency(
+    total_rows: usize,
+    min_rows_per_worker: usize,
+    max_workers: usize,
+) -> usize {
     if total_rows == 0 {
         return 1;
     }
@@ -140,9 +144,8 @@ pub fn executebatch_core(
     rows: Vec<Vec<ParamValue>>,
     chunk_size: usize,
 ) -> Result<BulkReport, CoreError> {
-    let (prefix, group) = split_single_row_insert(sql).map_err(|e| {
-        CoreError::Parameter(e.to_string())
-    })?;
+    let (prefix, group) =
+        split_single_row_insert(sql).map_err(|e| CoreError::Parameter(e.to_string()))?;
 
     let chunk_size = chunk_size.max(1);
     let mut total_rows_affected: i64 = 0;

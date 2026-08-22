@@ -386,9 +386,8 @@ impl Lease {
 }
 
 fn end_tran(hdbc: odbc_sys::HDbc, completion: odbc_sys::CompletionType) -> Result<(), CoreError> {
-    let ret = unsafe {
-        odbc_sys::SQLEndTran(odbc_sys::HandleType::Dbc, hdbc as *mut _, completion)
-    };
+    let ret =
+        unsafe { odbc_sys::SQLEndTran(odbc_sys::HandleType::Dbc, hdbc as *mut _, completion) };
     if ret == odbc_sys::SqlReturn::SUCCESS || ret == odbc_sys::SqlReturn::SUCCESS_WITH_INFO {
         return Ok(());
     }

@@ -20,7 +20,13 @@ fn quote_ident(id: &str) -> String {
 /// Arma el `MERGE` para un chunk de `chunk_rows` filas. `columns` es el
 /// orden canonico (de las keys del primer dict de Python, ver
 /// `tablesync/mod.rs`); `pk_columns` debe ser un subconjunto de `columns`.
-fn build_merge_sql(schema: &str, table: &str, pk_columns: &[String], columns: &[String], chunk_rows: usize) -> String {
+fn build_merge_sql(
+    schema: &str,
+    table: &str,
+    pk_columns: &[String],
+    columns: &[String],
+    chunk_rows: usize,
+) -> String {
     let qualified_table = format!("{}.{}", quote_ident(schema), quote_ident(table));
     let cols_quoted: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
     let non_pk: Vec<&String> = columns.iter().filter(|c| !pk_columns.contains(c)).collect();

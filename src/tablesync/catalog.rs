@@ -20,7 +20,11 @@ ORDER BY kc.ORDINAL_POSITION";
 /// `Vec` vacio = la tabla no tiene PK/indice unico en el catalogo -- regla
 /// dura de AGENTS.md ss4: sin PK, `merge()` degrada a INSERT con warning,
 /// NUNCA crashea y NUNCA hace un MERGE silencioso sin clave.
-pub fn primary_key_columns(lease: &Lease, schema: &str, table: &str) -> Result<Vec<String>, CoreError> {
+pub fn primary_key_columns(
+    lease: &Lease,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, CoreError> {
     let params = vec![
         ParamValue::Text(schema.to_string()),
         ParamValue::Text(table.to_string()),

@@ -161,7 +161,10 @@ fn env_key(prefix: &str, client: &str, env_name: &str) -> String {
     format!("{prefix}_{client}_{env_name}")
 }
 
-fn resolve_from_env(client_code: &str, environment: Option<&str>) -> Result<Credentials, CoreError> {
+fn resolve_from_env(
+    client_code: &str,
+    environment: Option<&str>,
+) -> Result<Credentials, CoreError> {
     let client = client_code.to_uppercase();
     let env_name = environment
         .map(str::to_string)
@@ -175,7 +178,9 @@ fn resolve_from_env(client_code: &str, environment: Option<&str>) -> Result<Cred
 
     let system = env::var(&system_key).ok().filter(|s| !s.trim().is_empty());
     let user = env::var(&user_key).ok().filter(|s| !s.trim().is_empty());
-    let password = env::var(&password_key).ok().filter(|s| !s.trim().is_empty());
+    let password = env::var(&password_key)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
     let mut missing = Vec::new();
     if system.is_none() {

@@ -91,7 +91,9 @@ impl Db2iEngine {
         credentials: PyRef<'_, Credentials>,
         options: Option<EngineOptions>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let dsn = resolve_dsn(&credentials)?;
+        // `credentials` es un `PyRef` (prestamo a la instancia Python); hay
+        // que deref explicito para pasarlo como `&Credentials`.
+        let dsn = resolve_dsn(&*credentials)?;
         Db2iEngine::connect_with_dsn(py, dsn, options.unwrap_or_default())
     }
 
@@ -222,7 +224,13 @@ impl Db2iEngine {
                     return Ok(py.None());
                 };
                 let value = row.first().unwrap_or(&ColumnValue::Null);
-                column_value_to_py(py, meta, value, options.strip_char_padding, &options.decimal_mode)
+                column_value_to_py(
+                    py,
+                    meta,
+                    value,
+                    options.strip_char_padding,
+                    &options.decimal_mode,
+                )
             })
         })
     }
@@ -279,15 +287,14 @@ impl Db2iEngine {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let lease = engine.acquire().await.map_err(to_py_err)?;
-            let (lease, cursor) = tokio::task::spawn_blocking(move || {
-                match lease.query_cursor(&sql, &params) {
+            let (lease, cursor) =
+                tokio::task::spawn_blocking(move || match lease.query_cursor(&sql, &params) {
                     Ok(cursor) => Ok((lease, cursor)),
                     Err(e) => Err(e),
-                }
-            })
-            .await
-            .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
-            .map_err(to_py_err)?;
+                })
+                .await
+                .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
+                .map_err(to_py_err)?;
 
             // `BatchStream` sostiene el `Lease` vivo (no vuelve al pool)
             // mientras el cursor exista -- el `HStmt` del cursor pertenece a
@@ -358,7 +365,14 @@ impl Db2iEngine {
             tokio::task::spawn_blocking(move || {
                 Python::with_gil(|py| {
                     let bound = params_owned.bind(py);
-                    crate::proc::call_proc_sync(&engine, &schema, &proc, bound, strip, &decimal_mode)
+                    crate::proc::call_proc_sync(
+                        &engine,
+                        &schema,
+                        &proc,
+                        bound,
+                        strip,
+                        &decimal_mode,
+                    )
                 })
             })
             .await
@@ -373,10 +387,10 @@ impl Db2iEngine {
     /// herencia (ver `tablesync/mod.rs`).
     #[cfg(feature = "tablesync")]
     #[pyo3(signature = (source=None))]
-    fn table_sync(&self, source: Option<PyRef<'_, Db2iEngine>>) -> crate::tablesync::TableSync {
+    fn table_sync(&self, source: Option<Py<Db2iEngine>>) -> crate::tablesync::TableSync {
         crate::tablesync::TableSync::new(
             self.engine.clone(),
-            source.map(|s| s.engine.clone()),
+            source.map(|s| s.borrow().engine.clone()),
             self.options.merge_chunk_size,
         )
     }

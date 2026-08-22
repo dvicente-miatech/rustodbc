@@ -101,7 +101,7 @@ impl BatchStream {
     }
 
     fn __anext__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let Some(rx) = self.rx.take() else {
+        let Some(mut rx) = self.rx.take() else {
             return pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 Err(PyStopAsyncIteration::new_err(()))
             });
@@ -119,7 +119,8 @@ impl BatchStream {
                 PyRuntimeError::new_err("BatchStream: canal cerrado (stream cerrado o cancelado)")
             })?;
 
-            if batch.is_empty() {
+            let is_empty = matches!(&batch, Ok(b) if b.is_empty());
+            if is_empty {
                 exhausted.store(true, Ordering::SeqCst);
                 return Err(PyStopAsyncIteration::new_err(()));
             }

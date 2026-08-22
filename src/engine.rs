@@ -58,7 +58,7 @@ pub(crate) fn resolve_dsn(credentials: &Credentials) -> PyResult<SecretString> {
 /// Crea un `Engine` (pool) de forma async, dentro de `spawn_blocking`.
 pub(crate) async fn connect_impl(
     dsn: SecretString,
-    options: &EngineOptions,
+    options: EngineOptions,
 ) -> PyResult<core::Engine> {
     let pool_size = options.pool_size;
     let login_timeout = options.login_timeout;
@@ -68,7 +68,7 @@ pub(crate) async fn connect_impl(
         .map_err(to_py_err)
 }
 
-async fn run_blocking<T, F>(engine: &SharedEngine, f: F) -> PyResult<T>
+async fn run_blocking<T, F>(engine: SharedEngine, f: F) -> PyResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&core::Lease) -> Result<T, crate::errors::CoreError> + Send + 'static,
@@ -89,7 +89,7 @@ where
 }
 
 pub(crate) async fn execute_impl(
-    engine: &SharedEngine,
+    engine: SharedEngine,
     sql: String,
     params: Vec<ParamValue>,
 ) -> PyResult<i64> {
@@ -97,8 +97,8 @@ pub(crate) async fn execute_impl(
 }
 
 pub(crate) async fn fetch_all_impl(
-    engine: &SharedEngine,
-    options: &EngineOptions,
+    engine: SharedEngine,
+    options: EngineOptions,
     sql: String,
     params: Vec<ParamValue>,
 ) -> PyResult<Py<PyList>> {
@@ -115,8 +115,8 @@ pub(crate) async fn fetch_all_impl(
 }
 
 pub(crate) async fn fetch_one_impl(
-    engine: &SharedEngine,
-    options: &EngineOptions,
+    engine: SharedEngine,
+    options: EngineOptions,
     sql: String,
     params: Vec<ParamValue>,
 ) -> PyResult<PyObject> {
@@ -138,8 +138,8 @@ pub(crate) async fn fetch_one_impl(
 }
 
 pub(crate) async fn fetch_value_impl(
-    engine: &SharedEngine,
-    options: &EngineOptions,
+    engine: SharedEngine,
+    options: EngineOptions,
     sql: String,
     params: Vec<ParamValue>,
 ) -> PyResult<PyObject> {
@@ -160,8 +160,8 @@ pub(crate) async fn fetch_value_impl(
 }
 
 pub(crate) async fn fetch_column_impl(
-    engine: &SharedEngine,
-    options: &EngineOptions,
+    engine: SharedEngine,
+    options: EngineOptions,
     sql: String,
     params: Vec<ParamValue>,
 ) -> PyResult<Py<PyList>> {
@@ -188,7 +188,7 @@ pub(crate) async fn fetch_column_impl(
 /// Ejecuta una consulta en modo streaming: adquiere un lease y devuelve un
 /// `(Lease, RowCursor)` listo para `BatchStream`/`BlockingBatchStream`.
 pub(crate) async fn query_cursor_impl(
-    engine: &SharedEngine,
+    engine: SharedEngine,
     sql: String,
     params: Vec<ParamValue>,
 ) -> PyResult<(core::Lease, core::RowCursor)> {
@@ -203,7 +203,7 @@ pub(crate) async fn query_cursor_impl(
 }
 
 pub(crate) async fn executebatch_impl(
-    engine: &SharedEngine,
+    engine: SharedEngine,
     sql: String,
     rows: Vec<Vec<ParamValue>>,
     chunk_size: usize,
@@ -217,7 +217,7 @@ pub(crate) async fn executebatch_impl(
 }
 
 pub(crate) async fn call_proc_impl(
-    engine: &SharedEngine,
+    engine: SharedEngine,
     schema: String,
     proc: String,
     params: Py<PyAny>,
@@ -330,7 +330,7 @@ impl Db2iEngine {
     ) -> PyResult<Bound<'py, PyAny>> {
         let params = convert_params(py, params)?;
         let engine = self.engine.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, execute_impl(&engine, sql, params))
+        pyo3_async_runtimes::tokio::future_into_py(py, execute_impl(engine, sql, params))
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -343,10 +343,7 @@ impl Db2iEngine {
         let params = convert_params(py, params)?;
         let engine = self.engine.clone();
         let options = self.options.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            fetch_all_impl(&engine, &options, sql, params),
-        )
+        pyo3_async_runtimes::tokio::future_into_py(py, fetch_all_impl(engine, options, sql, params))
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -359,10 +356,7 @@ impl Db2iEngine {
         let params = convert_params(py, params)?;
         let engine = self.engine.clone();
         let options = self.options.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            fetch_one_impl(&engine, &options, sql, params),
-        )
+        pyo3_async_runtimes::tokio::future_into_py(py, fetch_one_impl(engine, options, sql, params))
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -377,7 +371,7 @@ impl Db2iEngine {
         let options = self.options.clone();
         pyo3_async_runtimes::tokio::future_into_py(
             py,
-            fetch_value_impl(&engine, &options, sql, params),
+            fetch_value_impl(engine, options, sql, params),
         )
     }
 
@@ -393,7 +387,7 @@ impl Db2iEngine {
         let options = self.options.clone();
         pyo3_async_runtimes::tokio::future_into_py(
             py,
-            fetch_column_impl(&engine, &options, sql, params),
+            fetch_column_impl(engine, options, sql, params),
         )
     }
 
@@ -415,7 +409,7 @@ impl Db2iEngine {
         let prefetch = options.prefetch_batches;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (lease, cursor) = query_cursor_impl(&engine, sql, params).await?;
+            let (lease, cursor) = query_cursor_impl(engine, sql, params).await?;
             Python::with_gil(|py| {
                 Py::new(
                     py,
@@ -454,7 +448,7 @@ impl Db2iEngine {
         let chunk_size = self.options.batch_size;
         pyo3_async_runtimes::tokio::future_into_py(
             py,
-            executebatch_impl(&engine, sql, rows, chunk_size),
+            executebatch_impl(engine, sql, rows, chunk_size),
         )
     }
 
@@ -477,7 +471,7 @@ impl Db2iEngine {
         let decimal_mode = self.options.decimal_mode.clone();
         pyo3_async_runtimes::tokio::future_into_py(
             py,
-            call_proc_impl(&engine, schema, proc, params_owned, strip, decimal_mode),
+            call_proc_impl(engine, schema, proc, params_owned, strip, decimal_mode),
         )
     }
 

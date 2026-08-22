@@ -127,7 +127,7 @@ impl BlockingEngine {
         check_no_running_loop(py)?;
         let params = to_params(py, params)?;
         let engine = self.engine.clone();
-        py.allow_threads(|| self.block_on(execute_impl(&engine, sql, params)))
+        py.allow_threads(move || self.block_on(execute_impl(engine, sql, params)))
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -141,7 +141,7 @@ impl BlockingEngine {
         let params = to_params(py, params)?;
         let engine = self.engine.clone();
         let options = self.options.clone();
-        py.allow_threads(|| self.block_on(fetch_all_impl(&engine, &options, sql, params)))
+        py.allow_threads(move || self.block_on(fetch_all_impl(engine, options, sql, params)))
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -155,7 +155,7 @@ impl BlockingEngine {
         let params = to_params(py, params)?;
         let engine = self.engine.clone();
         let options = self.options.clone();
-        py.allow_threads(|| self.block_on(fetch_one_impl(&engine, &options, sql, params)))
+        py.allow_threads(move || self.block_on(fetch_one_impl(engine, options, sql, params)))
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -169,7 +169,7 @@ impl BlockingEngine {
         let params = to_params(py, params)?;
         let engine = self.engine.clone();
         let options = self.options.clone();
-        py.allow_threads(|| self.block_on(fetch_value_impl(&engine, &options, sql, params)))
+        py.allow_threads(move || self.block_on(fetch_value_impl(engine, options, sql, params)))
     }
 
     #[pyo3(signature = (sql, params=None))]
@@ -183,7 +183,7 @@ impl BlockingEngine {
         let params = to_params(py, params)?;
         let engine = self.engine.clone();
         let options = self.options.clone();
-        py.allow_threads(|| self.block_on(fetch_column_impl(&engine, &options, sql, params)))
+        py.allow_threads(move || self.block_on(fetch_column_impl(engine, options, sql, params)))
     }
 
     /// Streaming sincrono por lotes (reemplaza `iter_dict_chunks`). Devuelve
@@ -203,7 +203,7 @@ impl BlockingEngine {
         let batch_size = batch_size.unwrap_or(options.stream_batch_size);
 
         let (lease, cursor) =
-            py.allow_threads(|| self.block_on(query_cursor_impl(&engine, sql, params)))?;
+            py.allow_threads(move || self.block_on(query_cursor_impl(engine, sql, params)))?;
 
         let runtime = self.runtime.handle().clone();
         Py::new(
@@ -223,7 +223,7 @@ impl BlockingEngine {
         let rows = crate::bulk::rows_to_param_values(py, &rows)?;
         let engine = self.engine.clone();
         let chunk_size = self.options.batch_size;
-        py.allow_threads(|| self.block_on(executebatch_impl(&engine, sql, rows, chunk_size)))
+        py.allow_threads(move || self.block_on(executebatch_impl(engine, sql, rows, chunk_size)))
     }
 
     #[pyo3(signature = (schema, proc, params=None))]
@@ -242,7 +242,7 @@ impl BlockingEngine {
         let engine = self.engine.clone();
         let strip = self.options.strip_char_padding;
         let decimal_mode = self.options.decimal_mode.clone();
-        py.allow_threads(|| {
+        py.allow_threads(move || {
             self.block_on(call_proc_impl(
                 &engine,
                 schema,

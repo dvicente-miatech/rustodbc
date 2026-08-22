@@ -21,7 +21,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::core::ffi::ColumnMeta;
-use crate::core::{ColumnValue, ParamValue, ProcParam, SharedEngine};
+use crate::core::{ColumnValue, ParamValue, SharedEngine};
 use crate::errors::{to_py_err, CoreError};
 use crate::params::param_value_from_python;
 use crate::rows::{batch_to_pylist, column_value_to_py};

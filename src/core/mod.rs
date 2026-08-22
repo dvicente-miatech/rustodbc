@@ -534,7 +534,7 @@ impl Lease {
         proc_name: &str,
         metadata: &[ProcParam],
         values: &[Option<ParamValue>],
-    ) -> Result<(CallResult, Vec<(usize, Option<String>)>), CoreError> {
+    ) -> Result<(CallResult, ProcOutParams), CoreError> {
         let placeholders = vec!["?"; metadata.len()].join(",");
         let sql = format!("{{CALL {schema}.{proc_name}({placeholders})}}");
 
@@ -679,3 +679,7 @@ pub type SharedEngine = Arc<Engine>;
 /// Resultado de `Lease::call`: todos los result sets de un statement
 /// multi-resultado (`(columnas, filas)` por cada uno).
 pub type CallResult = Vec<(Vec<ColumnMeta>, Vec<Vec<ColumnValue>>)>;
+
+/// Parametros OUT/INOUT de `Lease::call_proc`: `(indice_en_metadata,
+/// texto_o_NULL)` para cada parametro de salida.
+pub type ProcOutParams = Vec<(usize, Option<String>)>;

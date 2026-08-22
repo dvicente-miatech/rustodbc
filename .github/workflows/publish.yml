@@ -1,20 +1,25 @@
-# Publica a PyPI via Trusted Publishing (OIDC) -- sin token de larga vida
-# que rotar. Requiere configurar, UNA vez, el "trusted publisher" en
-# pypi.org -> proyecto "rustodbc" -> Publisher: GitHub -> este repo,
-# workflow "publish.yml", environment "pypi".
+# Publica a PyPI los assets de un GitHub Release (sdist + wheels) via
+# Trusted Publishing (OIDC) -- sin token de larga vida que rotar.
+#
+# Requiere configurar, UNA vez, el "trusted publisher" en pypi.org:
+#   Proyecto "rustodbc" -> Publisher: GitHub -> este repo ->
+#   workflow "publish.yml" -> environment "pypi".
+#
+# El release se arma con release.yml (workflow_dispatch manual) y sube el
+# sdist + wheels como assets; este workflow los baja y los publica a PyPI.
 
-name: Publish to PyPI
+name: Publish
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version a publicar (ej. 0.2.0). Vacio = ultimo release.'
+        description: 'Version to publish (e.g. 0.2.0). Leave empty for latest.'
         required: false
         type: string
 
 jobs:
-  publish:
+  publish-to-pypi:
     name: Publish to PyPI
     runs-on: ubuntu-latest
     environment:
@@ -22,37 +27,40 @@ jobs:
       url: https://pypi.org/project/rustodbc
     permissions:
       id-token: write
-      contents: read
+      contents: read  # Required for gh release download
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Determinar el tag del release
+      - name: Determine Release Tag
         id: get_tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ -z "${{ inputs.version }}" ]; then
+            echo "No version provided, fetching latest release..."
             LATEST_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            echo "Latest tag: $LATEST_TAG"
             echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
           else
-            V="${{ inputs.version }}"
-            if [[ "$V" == v* ]]; then
-              echo "tag=$V" >> "$GITHUB_OUTPUT"
+            echo "Using provided version: v${{ inputs.version }}"
+            # Ensure v prefix if missing, though user prompt implies raw version
+            if [[ "${{ inputs.version }}" == v* ]]; then
+               echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
             else
-              echo "tag=v$V" >> "$GITHUB_OUTPUT"
+               echo "tag=v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
             fi
           fi
 
-      - name: Descargar assets del release
+      - name: Download Release Assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download ${{ steps.get_tag.outputs.tag }} --dir dist --pattern "*"
+        run: |
+          echo "Downloading assets for tag: ${{ steps.get_tag.outputs.tag }}"
+          gh release download ${{ steps.get_tag.outputs.tag }} --dir dist --pattern "*"
 
-      - name: Listar archivos a publicar
+      - name: List files
         run: ls -R dist/
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist

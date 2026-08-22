@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  checks: write
 
 jobs:
   lint:
@@ -31,51 +30,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Se captura la salida de clippy y se emite como annotations
-      # (`::error::`) -- visibles via la API de check-runs SIN permisos de
-      # admin, para poder leer los errores exactos desde el pipeline de
-      # diagnostico. El gate explicito al final mantiene el job rojo.
-      - name: cargo fmt + clippy (captura de errores)
-        id: lint
+      # Un solo paso para que el fmt NO tape los errores de clippy: se corre
+      # fmt (ignorando su salida), despues clippy (reporta errores de
+      # compilacion y lints), y al final fmt de nuevo como gatekeeper.
+      - name: cargo fmt + clippy
         shell: bash
-        continue-on-error: true
         run: |
-          set -o pipefail
           cargo fmt --check || true
-          cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.log
+          cargo clippy --all-targets --all-features -- -D warnings
           cargo fmt --check
-
-      - name: Publicar log completo al check-run (diagnostico)
-        if: always()
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          JOB_NAME: "${{ github.job }}"
-        run: |
-          LOG=$(tail -c 60000 /tmp/clippy.log 2>/dev/null || echo "(sin log)")
-          JOB_ID=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs" --jq ".jobs[] | select(.name == env.JOB_NAME) | .id" | head -1)
-          echo "JOB_ID=$JOB_ID"
-          jq -n --arg t "clippy log" --arg text "$LOG" '{output:{title:$t,text:$text}}' > /tmp/payload.json
-          gh api -X PATCH "repos/${{ github.repository }}/check-runs/$JOB_ID" --input /tmp/payload.json 2>&1 | head -5 || true
-
-      - name: Subir log completo como artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: clippy-log-${{ matrix.os }}
-          path: /tmp/clippy.log
-          if-no-files-found: ignore
-
-      - name: Gate -- lint
-        if: steps.lint.outcome == 'failure'
-        run: exit 1
 
       # Invariante de AGENTS.md ss4: el GIL nunca se sostiene en el hilo
       # bloqueante. Todo `Python::` en src/core/ (el FFI unsafe) es una
-      # violacion de esa regla -- esto lo hace mecanico en vez de confiar
-      # en revisiones manuales. Se ignoran lineas de comentario/doc (//, ///,
-      # //!) -- los comentarios mencionan la regla, el codigo no debe usarla.
+      # violacion de esa regla. Se ignoran lineas de comentario/doc (//,
+      # ///, //!) -- los comentarios mencionan la regla, el codigo no debe
+      # usarla.
       - name: Lint mecanico -- src/core/ nunca debe tocar el GIL
         if: runner.os == 'Linux'
         shell: bash
@@ -108,87 +77,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: cargo check --all-targets --all-features (captura de errores)
-        id: check
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          cargo check --all-targets --all-features 2>&1 | tee /tmp/check.log
-
-      - name: Publicar log completo al check-run (diagnostico)
-        if: always()
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          JOB_NAME: "${{ github.job }}"
-        run: |
-          LOG=$(tail -c 60000 /tmp/check.log 2>/dev/null || echo "(sin log)")
-          JOB_ID=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs" --jq ".jobs[] | select(.name == env.JOB_NAME) | .id" | head -1)
-          echo "JOB_ID=$JOB_ID"
-          jq -n --arg t "cargo check log" --arg text "$LOG" '{output:{title:$t,text:$text}}' > /tmp/payload.json
-          gh api -X PATCH "repos/${{ github.repository }}/check-runs/$JOB_ID" --input /tmp/payload.json 2>&1 | head -5 || true
-
-      - name: Subir log completo como artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: check-log-${{ matrix.os }}
-          path: /tmp/check.log
-          if-no-files-found: ignore
-
-      - name: Gate -- check
-        if: steps.check.outcome == 'failure'
-        run: exit 1
+      - name: cargo check --all-targets --all-features
+        run: cargo check --all-targets --all-features
 
       - name: pip install maturin
         run: python -m pip install --upgrade pip "maturin>=1.7,<2.0"
 
       # `maturin develop` requiere un virtualenv activo -- en CI no hay.
       # Se usa `maturin build` + `pip install <wheel>` (estandar para CI).
-      - name: maturin build --release (captura de errores)
-        id: maturin
+      - name: maturin build --release
+        run: maturin build --release
+
+      - name: Instalar wheel y smoke import
         shell: bash
-        continue-on-error: true
         run: |
-          set -o pipefail
-          maturin build --release 2>&1 | tee /tmp/maturin.log
-
-      - name: Subir log de maturin como artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: maturin-log-${{ matrix.os }}
-          path: /tmp/maturin.log
-          if-no-files-found: ignore
-
-      - name: Gate -- maturin
-        if: steps.maturin.outcome == 'failure'
-        run: exit 1
-
-      - name: Instalar wheel y smoke import (captura de errores)
-        id: smoke
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          {
-            pip install --force-reinstall target/wheels/rustodbc-*.whl
-            python -c "import rustodbc; print(rustodbc.__version__)"
-          } 2>&1 | tee /tmp/smoke.log
-
-      - name: Subir log de smoke como artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: smoke-log-${{ matrix.os }}
-          path: /tmp/smoke.log
-          if-no-files-found: ignore
-
-      - name: Gate -- smoke
-        if: steps.smoke.outcome == 'failure'
-        run: exit 1
+          pip install --force-reinstall target/wheels/rustodbc-*.whl
+          python -c "import rustodbc; print(rustodbc.__version__)"
 
       # No hay job de integracion contra un IBM i real: requiere un
       # sistema DB2 for i accesible, que no existe en runners de GitHub.

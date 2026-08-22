@@ -68,7 +68,7 @@ pub(crate) async fn connect_impl(
         .map_err(to_py_err)
 }
 
-async fn run_blocking<T, F>(engine: SharedEngine, f: F) -> PyResult<T>
+async fn run_blocking<T, F>(engine: &SharedEngine, f: F) -> PyResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&core::Lease) -> Result<T, crate::errors::CoreError> + Send + 'static,

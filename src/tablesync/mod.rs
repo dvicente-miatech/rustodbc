@@ -183,7 +183,6 @@ impl TableSync {
                 chunk_size,
                 primary_key,
             )
-            .map_err(to_py_err)
         })
     }
 }

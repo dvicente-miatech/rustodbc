@@ -102,9 +102,12 @@ impl BatchStream {
 
     fn __anext__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let Some(mut rx) = self.rx.take() else {
-            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                Err(PyStopAsyncIteration::new_err(()))
-            });
+            return pyo3_async_runtimes::tokio::future_into_py(
+                py,
+                async move -> PyResult<Py<pyo3::types::PyList>> {
+                    Err(PyStopAsyncIteration::new_err(()))
+                },
+            );
         };
         let exhausted = self.exhausted.clone();
         let options = self.options.clone();
@@ -152,7 +155,7 @@ impl BatchStream {
 
     fn aclose<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.exhausted.store(true, Ordering::SeqCst);
-        if let Some(rx) = self.rx.take() {
+        if let Some(mut rx) = self.rx.take() {
             rx.close();
         }
         self.task.abort();

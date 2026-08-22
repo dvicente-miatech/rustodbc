@@ -41,7 +41,7 @@ static DATETIME_MODULE: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
 fn datetime_module(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     let obj = DATETIME_MODULE.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
         let module = py.import_bound("datetime")?;
-        Ok(module.unbind())
+        Ok(module.into_any().unbind())
     })?;
     Ok(obj.bind(py))
 }

@@ -44,7 +44,7 @@ static DATETIME_MODULE: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
 fn datetime_module(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     let obj = DATETIME_MODULE.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
         let module = py.import_bound("datetime")?;
-        Ok(module.unbind())
+        Ok(module.into_any().unbind())
     })?;
     Ok(obj.bind(py))
 }
@@ -195,7 +195,7 @@ fn parse_timestamp(py: Python<'_>, text: &str) -> PyResult<PyObject> {
         split_hms(&time_part.replace('.', ":")).unwrap_or((0, 0, 0, 0))
     };
 
-    Ok(make_datetime(py, y, m, d, h, mi, s, micro))
+    make_datetime(py, y, m, d, h, mi, s, micro)
 }
 
 fn split_ymd(s: &str) -> Option<(i32, u8, u8)> {

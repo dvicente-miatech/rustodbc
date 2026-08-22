@@ -167,10 +167,28 @@ jobs:
         if: steps.maturin.outcome == 'failure'
         run: exit 1
 
-      - name: Instalar wheel y smoke import
+      - name: Instalar wheel y smoke import (captura de errores)
+        id: smoke
+        shell: bash
+        continue-on-error: true
         run: |
-          pip install --force-reinstall target/wheels/rustodbc-*.whl
-          python -c "import rustodbc; print(rustodbc.__version__)"
+          set -o pipefail
+          {
+            pip install --force-reinstall target/wheels/rustodbc-*.whl
+            python -c "import rustodbc; print(rustodbc.__version__)"
+          } 2>&1 | tee /tmp/smoke.log
+
+      - name: Subir log de smoke como artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-log-${{ matrix.os }}
+          path: /tmp/smoke.log
+          if-no-files-found: ignore
+
+      - name: Gate -- smoke
+        if: steps.smoke.outcome == 'failure'
+        run: exit 1
 
       # No hay job de integracion contra un IBM i real: requiere un
       # sistema DB2 for i accesible, que no existe en runners de GitHub.

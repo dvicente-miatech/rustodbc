@@ -281,7 +281,11 @@ await engine.execute(
 ### Escritura masiva (`executebatch`)
 
 Reescribe `INSERT ... VALUES (?,...)` a un `VALUES` multi-fila (el driver IBM i
-no soporta `SQL_ATTR_PARAMSET_SIZE`):
+no soporta `SQL_ATTR_PARAMSET_SIZE`). **Un solo lease** para todo el batch
+(no uno por lote) y **halve-and-retry de chunk size**: si un lote excede el
+límite de statement/parámetros de DB2 for i (SQL0101/SQL54001), se reduce a
+la mitad y se reintenta; el tamaño que funcionó queda cacheado por engine y
+se usa solo a partir de entonces.
 
 ```python
 report = await engine.executebatch(
@@ -289,6 +293,31 @@ report = await engine.executebatch(
     [[1, "x"], [2, "y"], [3, "z"]],
 )
 print(report.rows_affected, report.batches)
+```
+
+### Escritura masiva en paralelo (`batch_execute` / `parallel_execute`)
+
+Reparten la carga en varias conexiones del pool (workers), cada una con su
+propio lease. Sin éxito parcial silencioso: se juntan **todos** los errores
+antes de devolver el reporte. `fail_fast=True` (opt-in) cancela el resto al
+primer error.
+
+```python
+# batch_execute: un solo INSERT, filas partidas en workers
+report = await engine.batch_execute(
+    "INSERT INTO SCHEMA.TABLA (a, b) VALUES (?,?)",
+    [[1, "x"], [2, "y"], [3, "z"], [4, "w"]],
+    max_workers=4,      # default: EngineOptions.max_workers
+    fail_fast=False,    # default
+)
+print(report.rows_affected, report.failures)
+
+# parallel_execute: varias (sql, rows) independientes en paralelo
+report = await engine.parallel_execute([
+    ("INSERT INTO SCHEMA.A (id) VALUES (?)", [[1], [2]]),
+    ("INSERT INTO SCHEMA.B (id) VALUES (?)", [[3], [4]]),
+], max_workers=2)
+print(report.rows_affected, report.failures)
 ```
 
 ### Procedimientos (`call_proc`)
@@ -324,8 +353,26 @@ print(report.used_merge, report.rows_affected, report.warning)
 Sin PK → hace INSERT simple con `warning` (nunca crashea ni hace MERGE
 silencioso — regla dura de AGENTS.md ss4).
 
-En la fachada síncrona (`BlockingEngine`), usá `merge_sync` (mismo
-comportamiento, síncrono):
+#### Copiar tabla desde otro engine (`transfer`)
+
+Lee `schema.table` desde el engine `source` **en streaming** (RAM acotada por
+lote) y la mergea/inserta en `dest`. `select_sql` opcional permite un SELECT
+con filtro (debe devolver las mismas columnas que la tabla destino):
+
+```python
+sync = dest_engine.table_sync(source=ori_engine)   # source es OBLIGATORIO para transfer
+
+# copia SCHEMA.TABLA de ori_engine a dest_engine (mismo esquema/tabla en ambos)
+report = await sync.transfer("SCHEMA", "TABLA")
+
+# con filtro
+report = await sync.transfer("SCHEMA", "TABLA", select_sql="SELECT * FROM SCHEMA.TABLA WHERE activo = 1")
+
+print(report.rows_affected, report.used_merge, report.warning)
+```
+
+En la fachada síncrona (`BlockingEngine`), usá `merge_sync`/`transfer_sync`
+(mismo comportamiento, síncrono).
 
 ### Errores comunes
 
@@ -366,6 +413,20 @@ for batch in engine.stream("SELECT * FROM SCHEMA.HUGE_TABLE", batch_size=5000):
 ```python
 sync = engine.table_sync()
 report = sync.merge_sync("SCHEMA", "TABLA", [{"ID": 1, "VALOR": "a"}])
+```
+
+**Escritura en paralelo síncrona:**
+
+```python
+report = engine.batch_execute("INSERT INTO T (a) VALUES (?)", [[1], [2]], max_workers=4)
+report = engine.parallel_execute([("INSERT INTO A (id) VALUES (?)", [[1]]), ("INSERT INTO B (id) VALUES (?)", [[2]])])
+```
+
+**Copiar tabla síncrona** (requiere crear el sync con `source`):
+
+```python
+sync = dest_engine.table_sync(source=ori_engine)
+report = sync.transfer_sync("SCHEMA", "TABLA")
 ```
 
 **Regla importante:** `BlockingEngine` levanta `InterfaceError` si se llama

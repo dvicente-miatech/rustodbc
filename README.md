@@ -3,15 +3,13 @@
 Motor ODBC async en Rust para IBM DB2 for i (iSeries / AS400), expuesto como
 extensión de Python (PyO3 + maturin).
 
-Ver [AGENTS.md](AGENTS.md) para el diseño completo, el estado real de cada
-módulo, y el bloqueador de entorno activo (falta el toolchain C++ de MSVC en
-la máquina de desarrollo actual para poder compilar).
+Ver [AGENTS.md](AGENTS.md) para el diseño completo y el estado real de cada
+módulo.
 
-> **Estado del proyecto:** solo `Credentials`, `EngineOptions`, `load_dotenv`
-> y el árbol de excepciones están implementados de verdad hoy. El resto de la
-> API (`Db2iEngine`, streaming, `call_proc`, `executebatch`, `TableSync`) está
-> diseñado (ver `python/rustodbc/__init__.pyi`) pero **no compilado
-> todavía** — se marca explícitamente como tal en cada sección de abajo.
+> **Estado del proyecto:** la API async está implementada y el CI es verde
+> (`cargo fmt` + `clippy -D warnings` + build + smoke import en Windows y
+> Linux). La fachada síncrona `BlockingEngine` (`rustodbc.blocking`) sigue
+> como stub deliberado (Fase 11 del plan) — la API real hoy es async.
 
 ## Instalación
 
@@ -20,6 +18,9 @@ Una vez publicado en PyPI:
 ```bash
 pip install rustodbc-mi
 ```
+
+**El paquete de PyPI se llama `rustodbc-mi`** (así está registrado el trusted
+publisher en pypi.org), pero el `import` en Python es `rustodbc`.
 
 **El wheel solo no alcanza en runtime.** DB2 for i se habla a través del
 driver *IBM i Access ODBC Driver*, que no viene con el wheel (ver "Requisito
@@ -212,36 +213,125 @@ except rustodbc.QueryError as e:
 
 ---
 
-## Roadmap — diseñado, todavía no implementado
+## Uso async
 
-Todo lo que sigue existe como firma en `python/rustodbc/__init__.pyi` (fuente
-de verdad del diseño) pero **no tiene código Rust real detrás todavía**
-(bloqueado por falta del toolchain C++ en la máquina de desarrollo actual —
-ver AGENTS.md ss9). Se documenta acá para que quede claro el rumbo, no para
-generar la expectativa de que ya funciona.
+La API es async (basada en asyncio + un runtime tokio interno). Todo el ciclo
+de vida del engine debe correr dentro de **un solo event loop** — usá un único
+`asyncio.run(main())` o un único `loop.run_until_complete(...)`, nunca
+`asyncio.run()` por llamada (ver "Errores comunes" más abajo).
 
 ```python
-# Patrón async (planeado)
-engine = await rustodbc.Db2iEngine.from_env("ACME", "PROD")
-rows = await engine.fetch_all("SELECT * FROM SCHEMA.TABLE WHERE id = ?", [123])
-async for row in engine.stream("SELECT * FROM SCHEMA.HUGE_TABLE"):
-    ...
-await engine.execute("UPDATE SCHEMA.TABLE SET x = ? WHERE id = ?", [1, 123])
-await engine.executebatch(sql, rows)          # cero llamadores medidos hoy
-result = await engine.call_proc("SCHEMA", "MI_PROC", {"in_param": 1})
+import asyncio
+import rustodbc
 
-# TableSync por composición, nunca por herencia
-sync = dest_engine.table_sync(source=ori_engine)
-await sync.merge("SCHEMA", "TABLA", records)
+async def main():
+    async with rustodbc.Db2iEngine.from_env("ACME", "PROD") as engine:
+        # ejecutar sin traer datos -> rowcount
+        n = await engine.execute("UPDATE SCHEMA.TABLA SET x = ? WHERE id = ?", [1, 123])
 
-# Fachada sincrona, para call-sites que hoy envuelven pyodbc en to_thread
-from rustodbc.blocking import BlockingEngine
-engine = BlockingEngine.from_env("ACME", "PROD")
-rows = engine.fetch_all(sql, params)
+        # traer todo -> list[dict]
+        rows = await engine.fetch_all("SELECT * FROM SCHEMA.TABLA WHERE id = ?", [123])
+        # rows[0] == {"ID": 123, "NOMBRE": "..."}
+
+        # una fila -> dict | None
+        row = await engine.fetch_one("SELECT * FROM SCHEMA.TABLA WHERE id = ?", [123])
+
+        # un solo valor / una columna
+        total = await engine.fetch_value("SELECT COUNT(*) FROM SCHEMA.TABLA")
+        ids = await engine.fetch_column("SELECT id FROM SCHEMA.TABLA")
+
+        # streaming por lotes (no carga todo en memoria) -> list[Row] por batch
+        async for batch in engine.stream_batches("SELECT * FROM SCHEMA.HUGE_TABLE", batch_size=5000):
+            for r in batch:
+                ...
+
+asyncio.run(main())
 ```
 
-`rustodbc.blocking` hoy levanta `NotImplementedError` explícitamente al
-importarse — no es un bug, es el estado real documentado.
+Conexión explícita (en vez de `async with`):
+
+```python
+engine = await rustodbc.Db2iEngine.connect(creds)   # o .from_env("ACME", "PROD")
+try:
+    rows = await engine.fetch_all(sql)
+finally:
+    engine.close()   # idempotente
+```
+
+### Parámetros
+
+Posicionales (`list`/`tuple` o `None`). Tipos: `str`, `int`, `float`, `bool`,
+`decimal.Decimal`, `bytes`/`bytearray`, `date`/`time`/`datetime`, `None`.
+`DECIMAL`/`NUMERIC`/`DECFLOAT` llegan siempre como `Decimal` exacto (nunca
+float), con `decimal_mode="decimal"` por defecto.
+
+```python
+from decimal import Decimal
+from datetime import date
+
+await engine.execute(
+    "INSERT INTO T (importe, fecha, ok) VALUES (?, ?, ?)",
+    [Decimal("123.45"), date(2026, 8, 22), True],
+)
+```
+
+### Escritura masiva (`executebatch`)
+
+Reescribe `INSERT ... VALUES (?,...)` a un `VALUES` multi-fila (el driver IBM i
+no soporta `SQL_ATTR_PARAMSET_SIZE`):
+
+```python
+report = await engine.executebatch(
+    "INSERT INTO SCHEMA.TABLA (a, b) VALUES (?,?)",
+    [[1, "x"], [2, "y"], [3, "z"]],
+)
+print(report.rows_affected, report.batches)
+```
+
+### Procedimientos (`call_proc`)
+
+```python
+result = await engine.call_proc("SCHEMA", "MI_PROC", [1, "parametro"])
+# result.result_sets -> list[list[Row]]
+```
+
+### MERGE/upsert (`TableSync`)
+
+Por composición, nunca herencia:
+
+```python
+class TransferRepository:
+    def __init__(self, ori, dest):
+        self.sync = dest.table_sync(source=ori)
+
+sync = dest_engine.table_sync(source=ori_engine)
+report = await sync.merge(
+    "SCHEMA", "TABLA",
+    [{"ID": 1, "VALOR": "a"}, {"ID": 2, "VALOR": "b"}],
+    # primary_key=["ID"],   # opcional; si se omite, lo saca del catálogo
+)
+print(report.used_merge, report.rows_affected, report.warning)
+```
+
+Sin PK → hace INSERT simple con `warning` (nunca crashea ni hace MERGE
+silencioso — regla dura de AGENTS.md ss4).
+
+### Errores comunes
+
+- **`no running event loop`** al conectar/consultar: usaste dos `asyncio.run()`
+  separados (uno para `connect` y otro para `fetch_all`). Cada `asyncio.run()`
+  crea y cierra su propio event loop, y el engine no sobrevive al cierre.
+  Usá un solo `asyncio.run(main())` con todo adentro.
+- **`Type "Db2iEngine" is not awaitable`** (warning de Pyright/Pylance): era un
+  bug del stub `.pyi`; `connect`/`from_env` ya están tipados como `async def`.
+
+## Síncrono (`BlockingEngine`)
+
+La fachada síncrona **todavía no está implementada** (Fase 11 del plan, a
+propósito: se hace como proyección delgada sobre la API async ya estable, no
+como una segunda implementación). Hoy `rustodbc.blocking` levanta
+`NotImplementedError`. Mientras tanto, el patrón para código síncrono es
+envolver en `asyncio.run()` (ver arriba) o mantener la API async.
 
 ---
 
@@ -264,16 +354,20 @@ buffers `SQLWCHAR`/CCSID. Ver AGENTS.md ss2 y ss9 para el detalle completo.
 
 ## CI/CD
 
-- `.github/workflows/ci.yml` — `cargo fmt`/`clippy`/`build` + `maturin
-  develop` + smoke import, en Windows y Linux, en cada push/PR.
+- `.github/workflows/ci.yml` — en cada push/PR: `cargo fmt` + `clippy
+  --all-targets --all-features -- -D warnings` + lint mecánico del GIL, y
+  `cargo check` + `maturin build` + smoke import del wheel, en Windows y
+  Linux.
 - `.github/workflows/release.yml` — `workflow_dispatch` manual: bump de
-  versión, tag, build de sdist + wheels (Windows x64, Linux x86_64
-  manylinux/musllinux) vía `maturin-action`, y creación de un GitHub Release
-  con todos los artifacts adjuntos.
-- `.github/workflows/publish.yml` — `workflow_dispatch` manual: descarga los
-  assets de un release y los publica a PyPI vía Trusted Publishing (OIDC, sin
-  token de larga vida). Requiere configurar el *trusted publisher* una vez en
-  pypi.org para este repo.
+  versión + tag, build de sdist + wheels. Windows con `maturin-action`;
+  Linux (manylinux_2_28 y musllinux_1_2 x86_64) con `cibuildwheel` usando las
+  imágenes oficiales de PyPA y `auditwheel --exclude libodbc.so.*`. Crea un
+  GitHub Release con todos los assets.
+- `.github/workflows/publish.yml` — `workflow_dispatch` manual: baja los
+  assets del release y los publica a PyPI (`rustodbc-mi`) vía Trusted
+  Publishing (OIDC, sin token de larga vida). Requiere el *trusted publisher*
+  configurado una vez en pypi.org para el proyecto `rustodbc-mi` (workflow
+  `publish.yml`, environment `pypi`).
 
 No hay wheels de macOS ni de Linux aarch64 hoy: no hay evidencia de que el
 driver *IBM i Access ODBC* exista para esas plataformas.

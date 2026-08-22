@@ -1,0 +1,185 @@
+# Arma los artifacts de un release (sdist + wheels) y publica un GitHub
+# Release con todos ellos adjuntos. La publicacion a PyPI es un workflow
+# separado (publish.yml) para poder re-publicar sin tener que re-buildear.
+#
+# Wheels: rustodbc usa maturin + abi3-py312 (un solo wheel por plataforma
+# sirve 3.12/3.13/3.14+), asi que la build se hace con PyO3/maturin-action,
+# no con cibuildwheel (que arma un wheel POR version de CPython -- no aplica
+# aca). Ver AGENTS.md ss2 "Wheels".
+#
+# Plataformas: Windows x64 (odbc32.lib del Windows SDK, nada que vendorear) y
+# Linux x86_64 manylinux + musllinux (unixODBC-devel en build, excluyendo
+# libodbc.so.* del wheel -- en runtime lo da la imagen con ibm-iaccess). No
+# hay macOS ni aarch64 todavia: no hay evidencia de que el driver *IBM i
+# Access ODBC* exista para esas plataformas. Ver AGENTS.md ss2/ss9.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version a liberar (ej. 0.2.0), sin la "v" inicial'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  bump_version:
+    name: Bump version + tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: v${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Actualizar version en Cargo.toml y pyproject.toml
+        run: |
+          sed -i 's/^version = ".*"/version = "${{ inputs.version }}"/' Cargo.toml
+          sed -i 's/^version = ".*"/version = "${{ inputs.version }}"/' pyproject.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml pyproject.toml
+          git commit -m "Bump version to ${{ inputs.version }}"
+          git tag v${{ inputs.version }}
+          git push origin v${{ inputs.version }}
+          git push
+
+  build_sdist:
+    name: Build sdist
+    needs: bump_version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump_version.outputs.tag }}
+
+      - name: Install unixODBC dev headers
+        run: sudo apt-get update && sudo apt-get install --yes unixodbc-dev
+
+      - name: maturin sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist__${{ github.sha }}
+          path: dist/*.tar.gz
+
+  build_windows_wheels:
+    name: Build wheels (Windows x64)
+    needs: bump_version
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump_version.outputs.tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist --features tablesync
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels_windows__${{ github.sha }}
+          path: dist/*.whl
+
+  build_linux_manylinux:
+    name: Build wheels (manylinux x86_64)
+    needs: bump_version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump_version.outputs.tag }}
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-unknown-linux-gnu
+          manylinux: "2_28"
+          before-script-linux: yum -y install unixODBC-devel
+          args: --release --out dist --features tablesync
+
+      # libodbc.so.* NUNCA se vendorea (ver AGENTS.md ss2 "trampa
+      # CCSID/SQLWCHAR"): cargar el driver de IBM con opciones de SQLWCHAR
+      # distintas a las del sistema es un riesgo real, no un detalle de
+      # empaquetado.
+      - name: auditwheel repair (excluir libodbc.so.*)
+        run: |
+          pip install auditwheel
+          for whl in dist/*.whl; do
+            auditwheel repair --exclude "libodbc.so.*" --wheel-dir dist_repaired "$whl"
+          done
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels_manylinux_x86_64__${{ github.sha }}
+          path: dist_repaired/*.whl
+
+  build_linux_musllinux:
+    name: Build wheels (musllinux x86_64)
+    needs: bump_version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump_version.outputs.tag }}
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-unknown-linux-musl
+          manylinux: musllinux_1_2
+          before-script-linux: apk add unixodbc-dev
+          args: --release --out dist --features tablesync
+
+      - name: auditwheel repair (excluir libodbc.so.*)
+        run: |
+          pip install auditwheel
+          for whl in dist/*.whl; do
+            auditwheel repair --exclude "libodbc.so.*" --wheel-dir dist_repaired "$whl" || cp "$whl" dist_repaired/
+          done
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels_musllinux_x86_64__${{ github.sha }}
+          path: dist_repaired/*.whl
+
+  create_release:
+    name: Crear GitHub Release
+    needs:
+      - bump_version
+      - build_sdist
+      - build_windows_wheels
+      - build_linux_manylinux
+      - build_linux_musllinux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Descargar todos los artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: '*__${{ github.sha }}'
+          merge-multiple: true
+
+      - name: Crear GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.bump_version.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rustodbc"
+version = "0.1.0"
+description = "Async ODBC engine for IBM DB2 for i (iSeries), written in Rust"
+requires-python = ">=3.12"
+license = { text = "MIT-0" }
+readme = "README.md"
+# Deliberate: zero Python runtime dependencies. See AGENTS.md ss1.
+dependencies = []
+
+[project.optional-dependencies]
+arrow = []  # documents the cargo "arrow" feature; the wheel itself differs, see AGENTS.md
+
+[tool.maturin]
+module-name = "rustodbc._rustodbc"
+python-source = "python"
+features = ["pyo3/extension-module"]

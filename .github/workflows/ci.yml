@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: fmt + clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install unixODBC dev headers (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes unixodbc-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Invariante de AGENTS.md ss4: el GIL nunca se sostiene en el hilo
+      # bloqueante. Todo `Python::` en src/core/ (el FFI unsafe) es una
+      # violacion de esa regla -- esto lo hace mecanico en vez de confiar
+      # en revisiones manuales.
+      - name: Lint mecanico -- src/core/ nunca debe tocar el GIL
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if grep -rn "Python::" src/core/ 2>/dev/null; then
+            echo "::error::src/core/ no debe referenciar Python:: (GIL) -- ver AGENTS.md ss4"
+            exit 1
+          fi
+
+  build:
+    name: build + smoke import (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install unixODBC dev headers (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes unixodbc-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: pip install maturin
+        run: python -m pip install --upgrade pip "maturin>=1.7,<2.0"
+
+      - name: maturin develop --release
+        run: maturin develop --release
+
+      - name: Smoke import
+        run: python -c "import rustodbc; print(rustodbc.__version__)"
+
+      # No hay job de integracion contra un IBM i real: requiere un
+      # sistema DB2 for i accesible, que no existe en runners de GitHub.
+      # Ver AGENTS.md ss9 "No hay integracion de CI".

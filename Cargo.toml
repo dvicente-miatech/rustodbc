@@ -1,0 +1,65 @@
+[package]
+name = "rustodbc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Async ODBC engine for IBM DB2 for i (iSeries), exposed as a Python extension"
+license = "MIT-0"
+repository = "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/mi-rustodbc-engine"
+publish = false
+
+[lib]
+name = "rustodbc"
+# cdylib for the Python extension; rlib kept so `cargo test`/`cargo check` can
+# exercise the pure-Rust core (src/core/) without going through PyO3 at all.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# tablesync is separable on purpose (see AGENTS.md ss2): removing it still
+# leaves a complete async ODBC driver with nothing else broken.
+default = ["tablesync"]
+tablesync = []
+# Off by default: pulls in arrow-rs (compile time + binary size) for a path
+# that today has zero consumers (fetch_df had zero call sites in the source).
+arrow = ["dep:arrow", "dep:arrow-array", "dep:arrow-schema"]
+
+[dependencies]
+# ---- PyO3 / Python interop ----------------------------------------------
+# abi3-py312: one wheel per platform for 3.12/3.13/3.14+, matching the
+# consumer's requires-python >=3.12. See AGENTS.md for the abi3 trade-offs.
+pyo3 = { version = "0.22", features = ["abi3-py312", "extension-module"] }
+pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
+pyo3-log = "0.11"
+
+# ---- async runtime -------------------------------------------------------
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures = "0.3"
+
+# ---- ODBC FFI (contained under src/core/ffi/) ---------------------------
+odbc-sys = "0.24"
+
+# ---- connection pool ------------------------------------------------------
+deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
+
+# ---- errors / diagnostics -------------------------------------------------
+thiserror = "1"
+
+# ---- config -----------------------------------------------------------
+dotenvy = "0.15"
+secrecy = "0.10"
+
+# ---- catalog cache (tablesync) --------------------------------------------
+dashmap = "6"
+
+# ---- logging ------------------------------------------------------------
+log = "0.4"
+
+# ---- optional: arrow export feature --------------------------------------
+arrow = { version = "53", optional = true, default-features = false }
+arrow-array = { version = "53", optional = true }
+arrow-schema = { version = "53", optional = true }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "unwind" # a Rust panic must not abort the whole Python process

@@ -1,0 +1,14 @@
+/target/
+/dist/
+/build/
+*.pyd
+*.so
+*.dll
+__pycache__/
+*.pyc
+.venv/
+.env
+*.egg-info/
+
+AGENTS.md
+CLAUDE.md

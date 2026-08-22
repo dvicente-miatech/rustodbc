@@ -1,0 +1,58 @@
+# Publica a PyPI via Trusted Publishing (OIDC) -- sin token de larga vida
+# que rotar. Requiere configurar, UNA vez, el "trusted publisher" en
+# pypi.org -> proyecto "rustodbc" -> Publisher: GitHub -> este repo,
+# workflow "publish.yml", environment "pypi".
+
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version a publicar (ej. 0.2.0). Vacio = ultimo release.'
+        required: false
+        type: string
+
+jobs:
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/rustodbc
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determinar el tag del release
+        id: get_tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "${{ inputs.version }}" ]; then
+            LATEST_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          else
+            V="${{ inputs.version }}"
+            if [[ "$V" == v* ]]; then
+              echo "tag=$V" >> "$GITHUB_OUTPUT"
+            else
+              echo "tag=v$V" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Descargar assets del release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download ${{ steps.get_tag.outputs.tag }} --dir dist --pattern "*"
+
+      - name: Listar archivos a publicar
+        run: ls -R dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

@@ -200,6 +200,7 @@ impl TableSync {
     /// en streaming (RAM acotada por lote) y escribe con MERGE (o INSERT si
     /// no hay PK).
     #[pyo3(signature = (source_schema, source_table, dest_schema, dest_table, *, select_sql=None, primary_key=None))]
+    #[allow(clippy::too_many_arguments)]
     fn transfer<'py>(
         &self,
         py: Python<'py>,
@@ -246,6 +247,7 @@ impl TableSync {
 
     /// Variante sincrona de `transfer` (fachada `BlockingEngine`).
     #[pyo3(signature = (source_schema, source_table, dest_schema, dest_table, *, select_sql=None, primary_key=None))]
+    #[allow(clippy::too_many_arguments)]
     fn transfer_sync(
         &self,
         py: Python<'_>,

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
+use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
 
 use crate::config::EngineOptions;
@@ -100,7 +100,7 @@ impl BatchStream {
                     _ = cancel_rx.recv() => {
                         // Cancelacion pedida por el consumidor: SQLCancel REAL
                         // sobre el statement + CONSUMIR la conexion.
-                        if let Ok(mut guard) = cursor.lock() {
+                        if let Ok(guard) = cursor.lock() {
                             let _ = guard.cancel();
                         }
                         drop(cursor);
@@ -169,7 +169,7 @@ impl BatchStream {
             // Tomar el receiver del mutex compartido. Se reinserta al final
             // (o se dropea en los caminos de error/agotado, lo que hace que
             // la tarea de prefetch vea `send` fallar y suelte el Lease).
-            let mut receiver = {
+            let receiver = {
                 let mut guard = rx.lock().await;
                 guard.take()
             };

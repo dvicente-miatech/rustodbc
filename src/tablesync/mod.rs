@@ -192,17 +192,21 @@ impl TableSync {
         })
     }
 
-    /// Copia `schema.table` desde el engine `source` al engine `dest`
-    /// (`select_sql` por defecto: `SELECT * FROM schema.table`; permite un
-    /// SELECT con filtro). Lee en streaming (RAM acotada por lote) y escribe
-    /// con MERGE (o INSERT si no hay PK). `select_sql` debe devolver las
-    /// mismas columnas que la tabla destino.
-    #[pyo3(signature = (schema, table, *, select_sql=None, primary_key=None))]
+    /// Copia `source_schema.source_table` desde el engine `source` al engine
+    /// `dest` como `dest_schema.dest_table` (4a: esquemas/tablas pueden ser
+    /// distintos). `select_sql` por defecto:
+    /// `SELECT * FROM source_schema.source_table` (permite un SELECT con
+    /// filtro; debe devolver las mismas columnas que la tabla destino). Lee
+    /// en streaming (RAM acotada por lote) y escribe con MERGE (o INSERT si
+    /// no hay PK).
+    #[pyo3(signature = (source_schema, source_table, dest_schema, dest_table, *, select_sql=None, primary_key=None))]
     fn transfer<'py>(
         &self,
         py: Python<'py>,
-        schema: String,
-        table: String,
+        source_schema: String,
+        source_table: String,
+        dest_schema: String,
+        dest_table: String,
         select_sql: Option<String>,
         primary_key: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -214,7 +218,8 @@ impl TableSync {
         })?;
         let dest = self.dest.clone();
         let chunk_size = self.merge_chunk_size;
-        let select_sql = select_sql.unwrap_or_else(|| format!("SELECT * FROM {schema}.{table}"));
+        let select_sql =
+            select_sql.unwrap_or_else(|| format!("SELECT * FROM {source_schema}.{source_table}"));
         let limits = dest.limits.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -226,8 +231,10 @@ impl TableSync {
                     &dest_lease,
                     &limits,
                     &select_sql,
-                    &schema,
-                    &table,
+                    &source_schema,
+                    &source_table,
+                    &dest_schema,
+                    &dest_table,
                     chunk_size,
                     primary_key,
                 )
@@ -238,12 +245,14 @@ impl TableSync {
     }
 
     /// Variante sincrona de `transfer` (fachada `BlockingEngine`).
-    #[pyo3(signature = (schema, table, *, select_sql=None, primary_key=None))]
+    #[pyo3(signature = (source_schema, source_table, dest_schema, dest_table, *, select_sql=None, primary_key=None))]
     fn transfer_sync(
         &self,
         py: Python<'_>,
-        schema: String,
-        table: String,
+        source_schema: String,
+        source_table: String,
+        dest_schema: String,
+        dest_table: String,
         select_sql: Option<String>,
         primary_key: Option<Vec<String>>,
     ) -> PyResult<MergeReport> {
@@ -260,7 +269,8 @@ impl TableSync {
         })?;
         let dest = self.dest.clone();
         let chunk_size = self.merge_chunk_size;
-        let select_sql = select_sql.unwrap_or_else(|| format!("SELECT * FROM {schema}.{table}"));
+        let select_sql =
+            select_sql.unwrap_or_else(|| format!("SELECT * FROM {source_schema}.{source_table}"));
         let limits = dest.limits.clone();
 
         py.allow_threads(move || {
@@ -275,8 +285,10 @@ impl TableSync {
                 &dest_lease,
                 &limits,
                 &select_sql,
-                &schema,
-                &table,
+                &source_schema,
+                &source_table,
+                &dest_schema,
+                &dest_table,
                 chunk_size,
                 primary_key,
             )
@@ -350,18 +362,22 @@ fn merge_report_sync(
 
 /// Lee `select_sql` desde `src_lease` en streaming (lotes de `chunk_size`),
 /// convierte cada lote a `Vec<Vec<ParamValue>>` con las columnas del SELECT y
-/// lo mergea/inserta en `dest_lease`. RAM acotada por lote.
+/// lo mergea/inserta en `dest_schema.dest_table` (en `dest_lease`). RAM
+/// acotada por lote.
 #[allow(clippy::too_many_arguments)]
 fn transfer_report_sync(
     src_lease: &crate::core::Lease,
     dest_lease: &crate::core::Lease,
     limits: &std::sync::Mutex<crate::core::StatementLimits>,
     select_sql: &str,
-    schema: &str,
-    table: &str,
+    source_schema: &str,
+    source_table: &str,
+    dest_schema: &str,
+    dest_table: &str,
     chunk_size: usize,
     primary_key: Option<Vec<String>>,
 ) -> PyResult<MergeReport> {
+    let _ = (source_schema, source_table); // solo para el warning/mensaje
     let mut cursor = src_lease.query_cursor(select_sql, &[]).map_err(to_py_err)?;
     let columns_meta: Vec<ColumnMeta> = cursor.column_metas();
     if columns_meta.is_empty() {
@@ -376,7 +392,9 @@ fn transfer_report_sync(
 
     let pk_columns = match primary_key {
         Some(pk) => pk,
-        None => catalog::primary_key_columns(dest_lease, schema, table).map_err(to_py_err)?,
+        None => {
+            catalog::primary_key_columns(dest_lease, dest_schema, dest_table).map_err(to_py_err)?
+        }
     };
     let use_merge = !pk_columns.is_empty();
 
@@ -406,8 +424,8 @@ fn transfer_report_sync(
             merge::merge_rows(
                 dest_lease,
                 limits,
-                schema,
-                table,
+                dest_schema,
+                dest_table,
                 &pk_columns,
                 &columns,
                 &rows,
@@ -416,7 +434,13 @@ fn transfer_report_sync(
             .map_err(to_py_err)?
         } else {
             merge::insert_only_rows(
-                dest_lease, limits, schema, table, &columns, &rows, chunk_size,
+                dest_lease,
+                limits,
+                dest_schema,
+                dest_table,
+                &columns,
+                &rows,
+                chunk_size,
             )
             .map_err(to_py_err)?
         };
@@ -432,8 +456,8 @@ fn transfer_report_sync(
             None
         } else {
             Some(format!(
-                "{schema}.{table} no tiene PK/indice unico en el catalogo -- se hizo INSERT \
-                 simple, no MERGE"
+                "{dest_schema}.{dest_table} no tiene PK/indice unico en el catalogo -- se hizo \
+                 INSERT simple, no MERGE"
             ))
         },
     })

@@ -43,6 +43,27 @@ except ImportError:
     MergeReport = None  # type: ignore[assignment]
     TableSync = None  # type: ignore[assignment]
 
+
+def _db2i_engine_stream(self, sql=None, params=None, batch_size=None):
+    """Itera fila por fila (azucar sobre stream_batches, que entrega lotes).
+
+    Uso:
+        async for row in engine.stream("SELECT ..."):
+            ...
+    """
+
+    async def _gen():
+        async for batch in self.stream_batches(sql, params, batch_size):
+            for row in batch:
+                yield row
+
+    return _gen()
+
+
+# Pisa el metodo nativo `stream` (alias de stream_batches) por el generador
+# de filas. Las clases pyo3 SI aceptan asignacion de atributos a nivel clase.
+Db2iEngine.stream = _db2i_engine_stream  # type: ignore[attr-defined]
+
 __all__ = [
     "__version__",
     "Credentials",

@@ -419,6 +419,14 @@ impl Lease {
         self.conn.tainted = true;
     }
 
+    /// Consume la conexion permanentemente: la saca del pool y la cierra
+    /// fisica (`SQLDisconnect` + free al dropear). Usado por la cancelacion
+    /// de streams -- una conexion con statement cancelado se descarta, nunca
+    /// se recicla (regla dura AGENTS.md ss4).
+    pub fn take_connection(self) -> ffi::RawConnection {
+        managed::Object::take(self.conn)
+    }
+
     pub fn set_autocommit(&self, on: bool) -> Result<(), CoreError> {
         self.conn.set_autocommit(on)
     }

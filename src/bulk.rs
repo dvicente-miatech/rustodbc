@@ -130,7 +130,12 @@ pub fn rows_to_param_values(
 }
 
 /// Ejecuta un statement multi-row con un `(sql_builder, rows_chunk)` dado,
-/// aplicando halve-and-retry de chunk size contra SQL0101/SQL54001.
+/// aplicando:
+/// - **halve-and-retry** de chunk size contra SQL0101/SQL54001 (statement
+///   demasiado grande: reducir el lote a la mitad y reintentar el mismo
+///   rango), y
+/// - **reintentos con backoff creciente** para errores transitorios
+///   (SQL0913/SQL0904).
 ///
 /// `build_sql(chunk_rows)` arma el SQL para un lote de `chunk_rows` filas.
 /// `flatten(chunk)` aplana un chunk a `Vec<ParamValue>`.
@@ -145,6 +150,8 @@ pub(crate) fn execute_chunked_with_limits(
     flatten: impl Fn(&[Vec<ParamValue>]) -> Vec<ParamValue>,
     max_rows: Option<usize>,
 ) -> Result<(i64, usize, Option<usize>), CoreError> {
+    use crate::errors::{is_transient, TRANSIENT_BACKOFF_MS, TRANSIENT_MAX_RETRIES};
+
     // Tamano de lote a usar: el cacheado por halve-and-retry, o el pedido.
     let mut chunk_size = max_rows.unwrap_or(chunk_size.max(1)).max(1);
     let mut total = 0i64;
@@ -153,17 +160,17 @@ pub(crate) fn execute_chunked_with_limits(
 
     let mut idx = 0usize;
     while idx < rows.len() {
-        // Divide el resto en lotes de `chunk_size`, y si el lote que va a
-        // mandar es demasiado grande, baja el chunk_size (halve-and-retry).
+        // Divide el resto en lotes de `chunk_size`; si el lote que va a mandar
+        // es demasiado grande (SQL0101/54001), baja el chunk_size y reintenta
+        // este mismo rango (sin avanzar).
         let end = (idx + chunk_size).min(rows.len());
         let chunk = &rows[idx..end];
         let sql = build_sql(chunk.len());
         let flat = flatten(chunk);
+
         let affected = match lease.execute(&sql, &flat) {
             Ok(a) => a,
             Err(e) if is_reducible_size(e.native_code().unwrap_or(0)) => {
-                // El statement excede el limite: reducir a la mitad y
-                // reintentar este lote (no avanzar).
                 if chunk_size <= 1 {
                     return Err(e);
                 }
@@ -171,8 +178,36 @@ pub(crate) fn execute_chunked_with_limits(
                 discovered = Some(chunk_size);
                 continue;
             }
+            // Transitorio (SQL0913/SQL0904): reintentos con backoff creciente.
+            Err(e) if is_transient(e.native_code().unwrap_or(0)) => {
+                let mut last_err = e;
+                let mut done = None;
+                for attempt in 1..=TRANSIENT_MAX_RETRIES {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        TRANSIENT_BACKOFF_MS * u64::from(attempt),
+                    ));
+                    match lease.execute(&sql, &flat) {
+                        Ok(a) => {
+                            done = Some(a);
+                            break;
+                        }
+                        Err(retry_e) if is_transient(retry_e.native_code().unwrap_or(0)) => {
+                            last_err = retry_e; // sigue reintentando
+                        }
+                        Err(retry_e) => {
+                            last_err = retry_e; // no-transitorio: aborta
+                            break;
+                        }
+                    }
+                }
+                match done {
+                    Some(a) => a,
+                    None => return Err(last_err),
+                }
+            }
             Err(e) => return Err(e),
         };
+
         total += affected;
         batches += 1;
         idx = end;
@@ -220,51 +255,68 @@ pub fn executebatch_core_with_lease(
     })
 }
 
-/// Ejecuta `sql` (cualquier statement con `?`) contra `rows`, en paralelo
-/// con `workers` leases. Cada worker se queda con su subconjunto de filas y
-/// usa `execute_chunked_with_limits` para respetar los limites de statement.
-///
-/// Regla AGENTS.md ss4: se drena con `collect::<Vec<Result>>()` -- se juntan
-/// TODOS los errores antes de levantar `ParallelReport` (sin exito parcial
-/// silencioso). `fail_fast=True` cancela el resto al primer error.
-pub async fn batch_execute_async(
+/// Convierte un iterable de filas a una lista de CHUNKS listos para worker
+/// (`chunks[i]` = filas del chunk i). Se usa una vez; los workers toman los
+/// chunks completos sin re-clonar filas.
+pub fn rows_to_chunks(
+    py: Python<'_>,
+    rows: &Bound<'_, PyAny>,
+    chunk_size: usize,
+) -> PyResult<Vec<Vec<Vec<ParamValue>>>> {
+    let chunk_size = chunk_size.max(1);
+    let mut chunks: Vec<Vec<Vec<ParamValue>>> = Vec::new();
+    let mut current: Vec<Vec<ParamValue>> = Vec::with_capacity(chunk_size);
+
+    for row in rows.iter()? {
+        let row = row?;
+        let mut converted = Vec::new();
+        for item in row.iter()? {
+            converted.push(param_value_from_python(py, &item?)?);
+        }
+        current.push(converted);
+        if current.len() == chunk_size {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
+/// Ejecuta chunks ya convertidos en paralelo con `workers` leases. Cada
+/// tarea toma sus chunks completos (sin clonar filas) y ejecuta cada uno con
+/// su propio statement multi-row + halve-and-retry. Drena con
+/// `collect::<Vec<Result>>()` -- se juntan TODOS los errores antes de
+/// devolver el reporte (sin exito parcial silencioso).
+pub async fn batch_execute_chunks_async(
     engine: &SharedEngine,
     sql: String,
-    rows: Vec<Vec<ParamValue>>,
-    chunk_size: usize,
+    chunks: Vec<Vec<Vec<ParamValue>>>,
     workers: usize,
     fail_fast: bool,
 ) -> Result<ParallelReport, CoreError> {
     use futures::stream::{self, StreamExt};
 
     let workers = workers.max(1);
-    let total = rows.len();
-    let per_worker = total.div_ceil(workers);
-
-    // Partir las filas en `workers` subconjuntos disjuntos.
-    let mut tasks: Vec<Vec<Vec<ParamValue>>> = Vec::with_capacity(workers);
-    let mut idx = 0usize;
-    while idx < total {
-        let end = (idx + per_worker).min(total);
-        tasks.push(rows[idx..end].to_vec());
-        idx = end;
-    }
-    if tasks.is_empty() {
-        tasks.push(Vec::new());
+    // Repartir los chunks entre `workers` grupos disjuntos.
+    let mut groups: Vec<Vec<Vec<Vec<ParamValue>>>> = vec![Vec::new(); workers];
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        groups[i % workers].push(chunk);
     }
 
     let sql = std::sync::Arc::new(sql);
     let limits = engine.limits.clone();
 
-    let results: Vec<Result<BulkReport, CoreError>> = stream::iter(tasks.into_iter().enumerate())
-        .map(|(_, task_rows)| {
+    let results: Vec<Result<BulkReport, CoreError>> = stream::iter(groups)
+        .map(|group| {
             let engine = engine.clone();
             let sql = sql.clone();
             let limits = limits.clone();
             async move {
                 let lease = engine.acquire().await?;
                 tokio::task::spawn_blocking(move || {
-                    executebatch_core_with_lease(&lease, &limits, &sql, task_rows, chunk_size)
+                    executebatch_group_with_lease(&lease, &limits, &sql, group)
                 })
                 .await
                 .map_err(|e| CoreError::Connect(format!("panic: {e}")))?
@@ -296,8 +348,49 @@ pub async fn batch_execute_async(
     Ok(report)
 }
 
+/// Ejecuta los chunks de un grupo con UN lease, aplicando halve-and-retry a
+/// cada chunk via `execute_chunked_with_limits`.
+fn executebatch_group_with_lease(
+    lease: &Lease,
+    limits: &std::sync::Mutex<crate::core::StatementLimits>,
+    sql: &str,
+    group: Vec<Vec<Vec<ParamValue>>>,
+) -> Result<BulkReport, CoreError> {
+    let (prefix, placeholder) =
+        split_single_row_insert(sql).map_err(|e| CoreError::Parameter(e.to_string()))?;
+
+    let mut total = 0i64;
+    let mut batches = 0usize;
+
+    for chunk in group {
+        // Cada chunk ya tiene `chunk_size` filas (o menos, el ultimo); se
+        // ejecuta como UN statement multi-row con halve-and-retry.
+        let n = chunk.len();
+        let rows_slice = std::slice::from_ref(&chunk);
+        let (affected, chunk_batches, discovered) = execute_chunked_with_limits(
+            lease,
+            n,
+            rows_slice,
+            |rows_n| format!("{prefix}{}", vec![placeholder.as_str(); rows_n].join(",")),
+            |flat_chunk| flat_chunk.iter().flatten().cloned().collect(),
+            None,
+        )?;
+        total += affected;
+        batches += chunk_batches;
+
+        if let Some(d) = discovered {
+            limits.lock().unwrap().max_rows_per_statement = Some(d);
+        }
+    }
+
+    Ok(BulkReport {
+        rows_affected: total,
+        batches,
+    })
+}
+
 /// Ejecuta `tasks` (lista de `(sql, rows)`) en paralelo, cada una con su
-/// propio lease. Mismo patron de drenado que `batch_execute_async`.
+/// propio lease. Mismo patron de drenado que `batch_execute_chunks_async`.
 pub async fn parallel_execute_async(
     engine: &SharedEngine,
     tasks: Vec<(String, Vec<Vec<ParamValue>>)>,

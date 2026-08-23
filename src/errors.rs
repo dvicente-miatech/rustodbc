@@ -101,6 +101,16 @@ pub fn is_reducible_size(native_code: i32) -> bool {
     matches!(native_code.abs(), 101 | 54001) // SQL0101 | SQL54001
 }
 
+/// SQLCODEs transitorios de DB2 for i: fila/objeto en uso (SQL0913) o limite
+/// de recursos del sistema (SQL0904). Reintentar con backoff suele resolver.
+pub fn is_transient(native_code: i32) -> bool {
+    matches!(native_code.abs(), 913 | 904)
+}
+
+/// Reintentos y backoff base para errores transitorios en escritura masiva.
+pub const TRANSIENT_MAX_RETRIES: u32 = 3;
+pub const TRANSIENT_BACKOFF_MS: u64 = 100;
+
 /// Enum de error interno de Rust (capa `rustodbc-core`, sin PyO3). Se mapea a
 /// una excepcion Python concreta en el borde de la capa PyO3 (`to_py_err`).
 #[derive(thiserror::Error, Debug)]

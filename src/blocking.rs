@@ -237,14 +237,13 @@ impl BlockingEngine {
         fail_fast: bool,
     ) -> PyResult<crate::bulk::ParallelReport> {
         check_no_running_loop(py)?;
-        let rows = crate::bulk::rows_to_param_values(py, &rows)?;
-        let engine = self.engine.clone();
         let chunk_size = self.options.batch_size;
+        // 2d: convertir a chunks una sola vez (sin clonar filas por worker).
+        let chunks = crate::bulk::rows_to_chunks(py, &rows, chunk_size)?;
+        let engine = self.engine.clone();
         let workers = max_workers.unwrap_or(self.options.max_workers);
         py.allow_threads(move || {
-            self.block_on(batch_execute_impl(
-                engine, sql, rows, chunk_size, workers, fail_fast,
-            ))
+            self.block_on(batch_execute_impl(engine, sql, chunks, workers, fail_fast))
         })
     }
 

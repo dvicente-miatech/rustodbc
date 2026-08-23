@@ -248,6 +248,11 @@ async def main():
             for r in batch:
                 ...
 
+        # azúcar: `stream()` itera fila por fila (mismo batching interno,
+        # misma RAM acotada) sobre stream_batches.
+        async for row in engine.stream("SELECT * FROM SCHEMA.HUGE_TABLE"):
+            ...
+
 asyncio.run(main())
 ```
 
@@ -285,7 +290,10 @@ no soporta `SQL_ATTR_PARAMSET_SIZE`). **Un solo lease** para todo el batch
 (no uno por lote) y **halve-and-retry de chunk size**: si un lote excede el
 límite de statement/parámetros de DB2 for i (SQL0101/SQL54001), se reduce a
 la mitad y se reintenta; el tamaño que funcionó queda cacheado por engine y
-se usa solo a partir de entonces.
+se usa solo a partir de entonces. Además, los errores **transitorios**
+(SQL0913/SQL0904: fila/objeto en uso, límite de recursos) se reintentan con
+backoff creciente (3 reintentos) — como la BD no es transaccional, un chunk
+fallido no deja estado parcial.
 
 ```python
 report = await engine.executebatch(
@@ -355,18 +363,24 @@ silencioso — regla dura de AGENTS.md ss4).
 
 #### Copiar tabla desde otro engine (`transfer`)
 
-Lee `schema.table` desde el engine `source` **en streaming** (RAM acotada por
-lote) y la mergea/inserta en `dest`. `select_sql` opcional permite un SELECT
-con filtro (debe devolver las mismas columnas que la tabla destino):
+Lee `source_schema.source_table` desde el engine `source` **en streaming**
+(RAM acotada por lote) y la mergea/inserta en `dest_schema.dest_table` del
+engine `dest`. Origen y destino pueden ser esquemas/tablas distintos.
+`select_sql` opcional permite un SELECT con filtro (debe devolver las mismas
+columnas que la tabla destino):
 
 ```python
 sync = dest_engine.table_sync(source=ori_engine)   # source es OBLIGATORIO para transfer
 
-# copia SCHEMA.TABLA de ori_engine a dest_engine (mismo esquema/tabla en ambos)
-report = await sync.transfer("SCHEMA", "TABLA")
+# copia SCHEMA.TABLA de ori_engine a SCHEMA.TABLA de dest_engine
+report = await sync.transfer("SCHEMA", "TABLA", "SCHEMA", "TABLA")
+
+# esquemas/tablas distintos origen -> destino
+report = await sync.transfer("ORI", "TABLA_ORI", "DEST", "TABLA_DEST")
 
 # con filtro
-report = await sync.transfer("SCHEMA", "TABLA", select_sql="SELECT * FROM SCHEMA.TABLA WHERE activo = 1")
+report = await sync.transfer("ORI", "TABLA", "DEST", "TABLA",
+                             select_sql="SELECT * FROM ORI.TABLA WHERE activo = 1")
 
 print(report.rows_affected, report.used_merge, report.warning)
 ```
@@ -426,7 +440,7 @@ report = engine.parallel_execute([("INSERT INTO A (id) VALUES (?)", [[1]]), ("IN
 
 ```python
 sync = dest_engine.table_sync(source=ori_engine)
-report = sync.transfer_sync("SCHEMA", "TABLA")
+report = sync.transfer_sync("ORI", "TABLA_ORI", "DEST", "TABLA_DEST")
 ```
 
 **Regla importante:** `BlockingEngine` levanta `InterfaceError` si se llama

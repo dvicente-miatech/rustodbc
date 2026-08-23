@@ -222,12 +222,11 @@ pub(crate) async fn executebatch_impl(
 pub(crate) async fn batch_execute_impl(
     engine: SharedEngine,
     sql: String,
-    rows: Vec<Vec<ParamValue>>,
-    chunk_size: usize,
+    chunks: Vec<Vec<Vec<ParamValue>>>,
     workers: usize,
     fail_fast: bool,
 ) -> PyResult<crate::bulk::ParallelReport> {
-    crate::bulk::batch_execute_async(&engine, sql, rows, chunk_size, workers, fail_fast)
+    crate::bulk::batch_execute_chunks_async(&engine, sql, chunks, workers, fail_fast)
         .await
         .map_err(to_py_err)
 }
@@ -493,13 +492,14 @@ impl Db2iEngine {
         max_workers: Option<usize>,
         fail_fast: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let rows = crate::bulk::rows_to_param_values(py, &rows)?;
-        let engine = self.engine.clone();
         let chunk_size = self.options.batch_size;
+        // 2d: convertir a chunks una sola vez (sin clonar filas por worker).
+        let chunks = crate::bulk::rows_to_chunks(py, &rows, chunk_size)?;
+        let engine = self.engine.clone();
         let workers = max_workers.unwrap_or(self.options.max_workers);
         pyo3_async_runtimes::tokio::future_into_py(
             py,
-            batch_execute_impl(engine, sql, rows, chunk_size, workers, fail_fast),
+            batch_execute_impl(engine, sql, chunks, workers, fail_fast),
         )
     }
 

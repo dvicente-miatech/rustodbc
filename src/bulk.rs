@@ -366,11 +366,10 @@ fn executebatch_group_with_lease(
         // Cada chunk ya tiene `chunk_size` filas (o menos, el ultimo); se
         // ejecuta como UN statement multi-row con halve-and-retry.
         let n = chunk.len();
-        let rows_slice = std::slice::from_ref(&chunk);
         let (affected, chunk_batches, discovered) = execute_chunked_with_limits(
             lease,
             n,
-            rows_slice,
+            &chunk,
             |rows_n| format!("{prefix}{}", vec![placeholder.as_str(); rows_n].join(",")),
             |flat_chunk| flat_chunk.iter().flatten().cloned().collect(),
             None,

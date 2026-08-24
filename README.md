@@ -358,6 +358,13 @@ report = await sync.merge(
 print(report.used_merge, report.rows_affected, report.warning)
 ```
 
+La PK se descubre sola del catálogo: primero vía `QSYS2.SYSCST`/`SYSKEYCST`
+(constraints del SQL schema) y, si la tabla no tiene constraint declarada, con
+fallback a `SYSIBM.SQLSPECIALCOLUMNS` — así cubre también **PFs nativos creados
+por DDS** (clave `K`), cuya clave solo aparece como "best row id" del catálogo
+ODBC. Si necesitás forzar otra clave (o la tabla no se descubre bien), pasala
+explícita con `primary_key=[...]`.
+
 Sin PK → hace INSERT simple con `warning` (nunca crashea ni hace MERGE
 silencioso — regla dura de AGENTS.md ss4).
 

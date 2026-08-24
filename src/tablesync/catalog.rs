@@ -63,11 +63,13 @@ pub fn primary_key_columns(
     //    SQL schema, pero si aparece como "best row id" en SQLSPECIALCOLUMNS.
     //    La vista puede devolver la misma columna con distinto SCOPE (rowid de
     //    sesion vs. transaccion) -- se deduplica conservando el primer orden.
+    //    HashSet<String> (owned): las filas se consumen en el loop y no pueden
+    //    prestar &str a un set que sobrevive a la iteracion.
     let (_columns, rows) = lease.query(PK_QUERY_SPECIALCOLUMNS, &params)?;
-    let mut seen: HashSet<&str> = HashSet::with_capacity(rows.len());
+    let mut seen: HashSet<String> = HashSet::with_capacity(rows.len());
     for row in rows {
         if let Some(ColumnValue::Text(name)) = row.first() {
-            if seen.insert(name.as_str()) {
+            if seen.insert(name.clone()) {
                 out.push(name.clone());
             }
         }

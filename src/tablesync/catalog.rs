@@ -64,11 +64,11 @@ pub fn primary_key_columns(
     //    La vista puede devolver la misma columna con distinto SCOPE (rowid de
     //    sesion vs. transaccion) -- se deduplica conservando el primer orden.
     let (_columns, rows) = lease.query(PK_QUERY_SPECIALCOLUMNS, &params)?;
-    let mut seen = HashSet::with_capacity(rows.len());
+    let mut seen: HashSet<&str> = HashSet::with_capacity(rows.len());
     for row in rows {
         if let Some(ColumnValue::Text(name)) = row.first() {
-            if seen.insert(name.clone()) {
-                out.push(name);
+            if seen.insert(name.as_str()) {
+                out.push(name.clone());
             }
         }
     }

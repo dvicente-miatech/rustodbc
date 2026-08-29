@@ -128,7 +128,7 @@ pub fn column_value_to_py(
             SqlTypeFamily::Date => parse_date(py, text),
             SqlTypeFamily::Time => parse_time(py, text),
             SqlTypeFamily::Timestamp => parse_timestamp(py, text),
-            SqlTypeFamily::Text | SqlTypeFamily::Binary => {
+            SqlTypeFamily::Text | SqlTypeFamily::Clob | SqlTypeFamily::Binary => {
                 let s = if strip_char_padding {
                     text.trim_end()
                 } else {

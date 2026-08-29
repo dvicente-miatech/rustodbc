@@ -72,6 +72,7 @@ pub enum SqlTypeFamily {
     Date,
     Time,
     Timestamp,
+    Clob,
     Binary,
     Text,
 }
@@ -96,9 +97,16 @@ pub fn classify_sql_type(sql_type: i16) -> SqlTypeFamily {
         t if t == SqlDataType::DATE.0 => SqlTypeFamily::Date,
         t if t == SqlDataType::TIME.0 => SqlTypeFamily::Time,
         t if t == SqlDataType::TIMESTAMP.0 => SqlTypeFamily::Timestamp,
+        // LOBs de caracteres: CLOB=31, DBCLOB=32 y LONGVARCHAR=-1. Se leen con
+        // SQL_C_CHAR (get_data_text_lob): el driver IBM i Access ODBC no entrega
+        // columnas CLOB por SQL_C_WCHAR (devuelve sin datos; validado contra DEV
+        // con CCSID 284 y 1208). 30 = SQL_BLOB (extension IBM como CLOB, sin
+        // constante en odbc-sys): entra como Binary.
+        t if t == 31 || t == 32 || t == SqlDataType::EXT_LONG_VARCHAR.0 => SqlTypeFamily::Clob,
         t if t == SqlDataType::EXT_BINARY.0
             || t == SqlDataType::EXT_VAR_BINARY.0
-            || t == SqlDataType::EXT_LONG_VAR_BINARY.0 =>
+            || t == SqlDataType::EXT_LONG_VAR_BINARY.0
+            || t == 30 =>
         {
             SqlTypeFamily::Binary
         }
@@ -293,6 +301,66 @@ impl RawStatement {
             return Ok(None);
         }
         Ok(Some(from_utf16_lossy(&chunks)))
+    }
+
+    /// Trae una columna CLOB/LONGVARCHAR completa como texto (`SQL_C_CHAR`),
+    /// reensamblando llamadas sucesivas de `SQLGetData`. `Ok(None)` = NULL.
+    ///
+    /// El driver IBM i Access ODBC no entrega columnas CLOB por `SQL_C_WCHAR`
+    /// (el `get_data_text` normal devuelve sin datos; validado contra DEV con
+    /// CCSID 284 y 1208), así que los LOBs de caracteres se leen por bytes y
+    /// se decodifican como UTF-8 (los valores CHAR/VARCHAR siguen por WCHAR).
+    pub fn get_data_text_lob(&self, col: u16) -> Result<Option<String>, CoreError> {
+        const CHUNK: usize = 8192;
+        let mut out: Vec<u8> = Vec::new();
+        let mut saw_data = false;
+
+        loop {
+            let mut buf = [0u8; CHUNK];
+            let mut indicator: Len = 0;
+            let ret = unsafe {
+                SQLGetData(
+                    self.hstmt,
+                    col,
+                    CDataType::Char,
+                    buf.as_mut_ptr() as Pointer,
+                    CHUNK as Len,
+                    &mut indicator,
+                )
+            };
+
+            if ret == SqlReturn::NO_DATA {
+                break;
+            }
+            self.check(ret)?;
+
+            if indicator == odbc_sys::NULL_DATA {
+                if !saw_data {
+                    return Ok(None);
+                }
+                break;
+            }
+
+            saw_data = true;
+            let bytes_available = if indicator < 0 {
+                CHUNK
+            } else {
+                indicator as usize
+            };
+            let usable = bytes_available.min(CHUNK);
+            out.extend_from_slice(&buf[..usable]);
+
+            if indicator >= 0 && (indicator as usize) < CHUNK {
+                break;
+            }
+        }
+
+        if !saw_data {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8(out).unwrap_or_else(|e| {
+            String::from_utf8_lossy(e.as_bytes()).into_owned()
+        })))
     }
 
     /// Trae una columna binaria completa (`SQL_C_BINARY`), reensamblando

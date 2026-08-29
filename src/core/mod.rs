@@ -325,16 +325,26 @@ fn fetch_row(stmt: &RawStatement, columns: &[ColumnMeta]) -> Result<Vec<ColumnVa
     let mut row = Vec::with_capacity(columns.len());
     for (i, meta) in columns.iter().enumerate() {
         let col = (i + 1) as u16;
-        let value = if classify_sql_type(meta.sql_type) == SqlTypeFamily::Binary {
-            match stmt.get_data_binary(col)? {
+        let value = match classify_sql_type(meta.sql_type) {
+            SqlTypeFamily::Binary => match stmt.get_data_binary(col)? {
                 Some(b) => ColumnValue::Binary(b),
                 None => ColumnValue::Null,
-            }
-        } else {
-            match stmt.get_data_text(col)? {
+            },
+            SqlTypeFamily::Clob => match stmt.get_data_text(col)? {
+                Some(s) => ColumnValue::Text(s),
+                // El driver iSeries de Windows no entrega CLOB por SQL_C_WCHAR
+                // (primera llamada sin datos; validado contra DEV con CCSID 284
+                // y 1208). Fallback a SQL_C_CHAR solo para ese caso: en Linux el
+                // camino WCHAR funciona y el CHAR corrompe LOBs multichunk.
+                None => match stmt.get_data_text_lob(col)? {
+                    Some(s) => ColumnValue::Text(s),
+                    None => ColumnValue::Null,
+                },
+            },
+            _ => match stmt.get_data_text(col)? {
                 Some(s) => ColumnValue::Text(s),
                 None => ColumnValue::Null,
-            }
+            },
         };
         row.push(value);
     }

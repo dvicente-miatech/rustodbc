@@ -21,9 +21,9 @@ use secrecy::SecretString;
 use crate::config::{Credentials, EngineOptions};
 use crate::core::{Lease, ParamValue, SharedEngine};
 use crate::engine::{
-    batch_execute_impl, call_proc_impl, connect_impl, execute_impl, executebatch_impl,
-    fetch_all_impl, fetch_column_impl, fetch_one_impl, fetch_value_impl, parallel_execute_impl,
-    query_cursor_impl, resolve_dsn,
+    batch_execute_impl, call_proc_args_impl, call_proc_impl, connect_impl, execute_impl,
+    executebatch_impl, fetch_all_impl, fetch_column_impl, fetch_one_impl, fetch_value_impl,
+    parallel_execute_impl, query_cursor_impl, resolve_dsn,
 };
 use crate::errors::{to_py_err, CoreError};
 use crate::params::params_from_python;
@@ -301,6 +301,37 @@ impl BlockingEngine {
         let decimal_mode = self.options.decimal_mode.clone();
         py.allow_threads(move || {
             self.block_on(call_proc_impl(
+                engine,
+                schema,
+                proc,
+                params_owned,
+                strip,
+                decimal_mode,
+            ))
+        })
+    }
+
+    /// Variante POSICIONAL de `call_proc` (secuencia en orden ordinal, sin
+    /// nombres). Valida cada valor contra el tipo/largo declarado del parametro
+    /// y levanta `ProcValidationError` si hay fallos. Ver `Db2iEngine`.
+    #[pyo3(signature = (schema, proc, params=None))]
+    fn call_proc_args(
+        &self,
+        py: Python<'_>,
+        schema: String,
+        proc: String,
+        params: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<crate::proc::ProcResult>> {
+        check_no_running_loop(py)?;
+        let params_owned: Py<PyAny> = match params {
+            Some(p) => p.unbind(),
+            None => py.None(),
+        };
+        let engine = self.engine.clone();
+        let strip = self.options.strip_char_padding;
+        let decimal_mode = self.options.decimal_mode.clone();
+        py.allow_threads(move || {
+            self.block_on(call_proc_args_impl(
                 engine,
                 schema,
                 proc,

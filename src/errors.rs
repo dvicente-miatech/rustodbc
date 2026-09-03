@@ -24,6 +24,7 @@ create_exception!(rustodbc, IntegrityError, QueryError); // SQLSTATE 23xxx
 create_exception!(rustodbc, DataError, QueryError); // SQLSTATE 22xxx
 create_exception!(rustodbc, OperationTimeout, QueryError); // HYT00 / HYT01
 create_exception!(rustodbc, ParameterError, RustOdbcError);
+create_exception!(rustodbc, ProcValidationError, ParameterError);
 create_exception!(rustodbc, BulkFailure, RustOdbcError);
 create_exception!(rustodbc, MergeFailure, RustOdbcError);
 create_exception!(rustodbc, CatalogError, RustOdbcError);
@@ -45,6 +46,10 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("DataError", py.get_type_bound::<DataError>())?;
     m.add("OperationTimeout", py.get_type_bound::<OperationTimeout>())?;
     m.add("ParameterError", py.get_type_bound::<ParameterError>())?;
+    m.add(
+        "ProcValidationError",
+        py.get_type_bound::<ProcValidationError>(),
+    )?;
     m.add("BulkFailure", py.get_type_bound::<BulkFailure>())?;
     m.add("MergeFailure", py.get_type_bound::<MergeFailure>())?;
     m.add("CatalogError", py.get_type_bound::<CatalogError>())?;

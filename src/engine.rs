@@ -268,6 +268,33 @@ pub(crate) async fn call_proc_impl(
     .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
 }
 
+/// Variante posicional (`call_proc_args`): misma vida que `call_proc_impl` pero
+/// despacha a `proc::call_proc_args_sync` (validacion por tipo/orden).
+pub(crate) async fn call_proc_args_impl(
+    engine: SharedEngine,
+    schema: String,
+    proc: String,
+    params: Py<PyAny>,
+    strip_char_padding: bool,
+    decimal_mode: String,
+) -> PyResult<Py<crate::proc::ProcResult>> {
+    tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            let bound = params.bind(py);
+            crate::proc::call_proc_args_sync(
+                &engine,
+                &schema,
+                &proc,
+                bound,
+                strip_char_padding,
+                &decimal_mode,
+            )
+        })
+    })
+    .await
+    .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
+}
+
 #[pyclass(module = "rustodbc")]
 pub struct Db2iEngine {
     pub(crate) engine: SharedEngine,
@@ -561,6 +588,35 @@ impl Db2iEngine {
         pyo3_async_runtimes::tokio::future_into_py(
             py,
             call_proc_impl(engine, schema, proc, params_owned, strip, decimal_mode),
+        )
+    }
+
+    /// `CALL schema.proc(val1, val2, ...)` -- variante POSICIONAL del
+    /// `call_proc`, sin nombres. `params` es una secuencia (`list`/`tuple`) en
+    /// el mismo orden ordinal que el catalogo (`SQLProcedureColumns`); los OUT
+    /// van como `None`. Valida cada valor contra el tipo/largo declarado del
+    /// parametro (largo en tipos de caracter, parseabilidad numerica, bit,
+    /// fecha) y, si hay fallos, levanta `ProcValidationError` con el mensaje
+    /// agregado. Los errores internos del procedimiento salen como
+    /// `QueryError`. Ver `proc.rs`.
+    #[pyo3(signature = (schema, proc, params=None))]
+    fn call_proc_args<'py>(
+        &self,
+        py: Python<'py>,
+        schema: String,
+        proc: String,
+        params: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let params_owned: Py<PyAny> = match params {
+            Some(p) => p.unbind(),
+            None => py.None(),
+        };
+        let engine = self.engine.clone();
+        let strip = self.options.strip_char_padding;
+        let decimal_mode = self.options.decimal_mode.clone();
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            call_proc_args_impl(engine, schema, proc, params_owned, strip, decimal_mode),
         )
     }
 

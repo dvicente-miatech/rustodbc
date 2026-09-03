@@ -340,6 +340,30 @@ result = await engine.call_proc("SCHEMA", "MI_PROC", {"IN_PARAM": 5})
 # result.out_params  -> {"OUT_PARAM": <valor>, ...}  # OUT/INOUT
 ```
 
+#### Variante posicional (`call_proc_args`) — sin nombres, con validación
+
+`call_proc_args` NO pide nombres: toma una **secuencia** (`list`/`tuple`) en el
+mismo **orden ordinal** que devuelve el catálogo (`SQLProcedureColumns`); los
+parámetros OUT van como `None`. Antes de llamar **valida cada valor** contra el
+tipo/largo declarado del parámetro (largo máximo en `CHAR`/`VARCHAR`, parseabilidad
+numérica en `DECIMAL`/`INTEGER`/`FLOAT`, `0|1`/`true|false` en bit, no-vacío en
+fechas). Si alguna variable no cumple, levanta `rustodbc.ProcValidationError`
+(subclase de `ParameterError`) con el mensaje agregado de **todas** las variables
+inválidas; los errores internos del procedimiento siguen saliendo como
+`QueryError`.
+
+```python
+# SP con IN_VAR1 varchar(1), IN_VAR2 varchar(2), IN_VAR3 varchar(3)
+result = await engine.call_proc_args("LIBPRBA", "PRUEBASP", ("A", "AB", "ABC"))
+# result.result_sets / result.out_params  ->  igual que call_proc
+```
+
+Nota: el bindeo sigue siendo texto (`SQL_C_WCHAR`/`VARCHAR`), así que **DB2 hace
+el cast** al tipo declarado (un `1` int para un `varchar(1)` llega como `"1"`; un
+`"1"` para un `DECIMAL` lo parsea DB2). La validación es client-side y corre
+antes de la llamada, para dar errores claros en vez del truncamiento silencioso
+que cortaría, por ejemplo, `"ABC"` en un `VARCHAR(1)` a `"A"`.
+
 ### MERGE/upsert (`TableSync`)
 
 Por composición, nunca herencia:

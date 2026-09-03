@@ -202,6 +202,13 @@ pub struct ProcParam {
     pub io_type: i16,
     pub sql_type: i16,
     pub column_size: usize,
+    /// Tipo tal como lo reporta el catalogo (`TYPE_NAME` de
+    /// `SQLProcedureColumns`, columna 7), p.ej. `VARCHAR`, `DECIMAL`, `DATE`.
+    /// Vacio si el driver no lo reporta.
+    pub type_name: String,
+    /// Escala del tipo (columna `DECIMAL_DIGITS`, 10). Relevante para
+    /// `DECIMAL(p,s)` en mensajes de error de validacion.
+    pub decimal_digits: i16,
 }
 
 /// Buffer de un parametro de `CALL`. Para IN/INOUT el valor de entrada se
@@ -237,6 +244,186 @@ fn param_value_to_text(v: Option<&ParamValue>) -> Option<String> {
         Some(ParamValue::I64(i)) => Some(i.to_string()),
         Some(ParamValue::F64(f)) => Some(f.to_string()),
         Some(ParamValue::Bytes(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+    }
+}
+
+/// Error de validacion de un parametro posicional de `CALL`, listo para
+/// mostrarse en el mensaje agregado de `ProcValidationError`. `index` es la
+/// posicion 0-based en la tupla recibida.
+#[derive(Debug, Clone)]
+pub struct ProcParamError {
+    pub index: usize,
+    pub name: String,
+    /// Tipo esperado legible, p.ej. `VARCHAR(1)`, `DECIMAL(5,2)`.
+    pub expected: String,
+    /// Valor tal como llego (texto), p.ej. `ABC`.
+    pub provided: String,
+    pub message: String,
+}
+
+/// Texto legible del tipo de un parametro de procedimiento, usado en mensajes
+/// de error de validacion. Ejemplos: `VARCHAR(1)`, `CHAR(3)`, `DECIMAL(5,2)`,
+/// `INTEGER`, `DATE`. Cae al nombre de la familia si el catalogo no reporto
+/// `TYPE_NAME`.
+pub fn format_param_type(p: &ProcParam) -> String {
+    let base = if p.type_name.is_empty() {
+        format!("{:?}", classify_sql_type(p.sql_type))
+    } else {
+        p.type_name.clone()
+    };
+    match classify_sql_type(p.sql_type) {
+        SqlTypeFamily::Text | SqlTypeFamily::Clob => {
+            if p.column_size > 0 {
+                format!("{base}({})", p.column_size)
+            } else {
+                base
+            }
+        }
+        SqlTypeFamily::Decimal => {
+            if p.column_size > 0 {
+                format!("{base}({}, {})", p.column_size, p.decimal_digits)
+            } else {
+                base
+            }
+        }
+        _ => base,
+    }
+}
+
+/// Check barato de parseabilidad numerica: acepta `123`, `-10`, `123.45`,
+/// `.5`, `123.`; rechaza `""`, `"-"`, `"."`, `"ABC"`.
+fn looks_numeric(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let mut has_digit = false;
+    for c in t.chars() {
+        match c {
+            '0'..='9' => has_digit = true,
+            '.' | '-' => {}
+            _ => return false,
+        }
+    }
+    has_digit
+}
+
+fn truncate_for_msg(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let mut out: String = text.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Valida un parametro posicional de `CALL` contra su metadata del catalogo
+/// (`ProcParam`). Devuelve `Ok(())` si el valor (ya convertido a texto) cumple
+/// con el tipo y el tamano declarados del parametro, o `Err(ProcParamError)` si
+/// no. `None`/`Null` se aceptan sin validar (NULL es siempre un input valido).
+///
+/// Reglas (ver AGENTS.md ss4): los `DECIMAL`/`NUMERIC`/`DECFLOAT` viajan como
+/// texto (nunca float). La validacion es client-side y corre ANTES de llamar al
+/// procedimiento, para dar errores claros en vez del truncamiento silencioso
+/// que hoy hace `bind_proc_params` (que corta el texto a `column_size`).
+pub fn validate_proc_param(
+    index: usize,
+    param: &ProcParam,
+    value: Option<&ParamValue>,
+) -> Result<(), ProcParamError> {
+    let Some(v) = value else {
+        return Ok(());
+    };
+    if matches!(v, ParamValue::Null) {
+        return Ok(());
+    }
+    let text = param_value_to_text(Some(v)).unwrap_or_default();
+    let expected = format_param_type(param);
+    let provided = text.clone();
+    let family = classify_sql_type(param.sql_type);
+
+    let err = |message: String| ProcParamError {
+        index,
+        name: param.name.clone(),
+        expected: expected.clone(),
+        provided: provided.clone(),
+        message,
+    };
+
+    match family {
+        // Largo en UTF-16 code units: la misma metrica que usa el bind
+        // (`text.encode_utf16()`), asi validacion y bindeo coinciden.
+        SqlTypeFamily::Text | SqlTypeFamily::Clob => {
+            let len = text.encode_utf16().count();
+            if len > param.column_size {
+                Err(err(format!(
+                    "el valor '{}' excede el largo maximo {} de {}",
+                    truncate_for_msg(&provided, 32),
+                    param.column_size,
+                    expected
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        SqlTypeFamily::Decimal => {
+            if looks_numeric(&text) {
+                Ok(())
+            } else {
+                Err(err(format!(
+                    "'{}' no es un numero valido para {}",
+                    truncate_for_msg(&provided, 32),
+                    expected
+                )))
+            }
+        }
+        SqlTypeFamily::Integer => {
+            if text.trim().parse::<i64>().is_ok() {
+                Ok(())
+            } else {
+                Err(err(format!(
+                    "'{}' no es un entero valido para {}",
+                    truncate_for_msg(&provided, 32),
+                    expected
+                )))
+            }
+        }
+        SqlTypeFamily::Float => {
+            if text.trim().parse::<f64>().is_ok() {
+                Ok(())
+            } else {
+                Err(err(format!(
+                    "'{}' no es un numero valido para {}",
+                    truncate_for_msg(&provided, 32),
+                    expected
+                )))
+            }
+        }
+        SqlTypeFamily::Bit => {
+            let t = text.trim();
+            if t == "0"
+                || t == "1"
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("false")
+            {
+                Ok(())
+            } else {
+                Err(err(format!(
+                    "'{}' no es un booleano valido para {} (0/1 o true/false)",
+                    truncate_for_msg(&provided, 32),
+                    expected
+                )))
+            }
+        }
+        SqlTypeFamily::Date | SqlTypeFamily::Time | SqlTypeFamily::Timestamp => {
+            if text.trim().is_empty() {
+                Err(err(format!("valor vacio no valido para {}", expected)))
+            } else {
+                Ok(())
+            }
+        }
+        SqlTypeFamily::Binary => Ok(()),
     }
 }
 
@@ -506,7 +693,8 @@ impl Lease {
         let mut params = Vec::new();
         while stmt.fetch()? {
             // Columnas de SQLProcedureColumns: 4=COLUMN_NAME, 5=COLUMN_TYPE,
-            // 6=DATA_TYPE, 8=COLUMN_SIZE. Se leen como texto (SQLGetData).
+            // 6=DATA_TYPE, 7=TYPE_NAME, 8=COLUMN_SIZE, 10=DECIMAL_DIGITS.
+            // Se leen como texto (SQLGetData).
             let name = stmt.get_data_text(4)?.unwrap_or_default();
             let io_type = stmt
                 .get_data_text(5)?
@@ -516,9 +704,14 @@ impl Lease {
                 .get_data_text(6)?
                 .and_then(|s| s.trim().parse::<i16>().ok())
                 .unwrap_or(0);
+            let type_name = stmt.get_data_text(7)?.unwrap_or_default();
             let column_size = stmt
                 .get_data_text(8)?
                 .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let decimal_digits = stmt
+                .get_data_text(10)?
+                .and_then(|s| s.trim().parse::<i16>().ok())
                 .unwrap_or(0);
 
             let is_param = io_type == ffi::stmt::SQL_PARAM_INPUT
@@ -530,6 +723,8 @@ impl Lease {
                     io_type,
                     sql_type,
                     column_size,
+                    type_name,
+                    decimal_digits,
                 });
             }
         }

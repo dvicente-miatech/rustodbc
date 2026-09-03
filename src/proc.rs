@@ -153,12 +153,7 @@ pub fn call_proc_sync(
 /// Mensaje agregado de `ProcValidationError`: lista cada variable invalida con
 /// su posicion, nombre, tipo esperado y motivo. Pasa por `scrub_password` antes
 /// de llegar a Python (regla dura de AGENTS.md ss8).
-fn proc_validation_error(
-    py: Python<'_>,
-    schema: &str,
-    proc_name: &str,
-    failures: &[ProcParamError],
-) -> PyErr {
+fn proc_validation_error(schema: &str, proc_name: &str, failures: &[ProcParamError]) -> PyErr {
     let parts: Vec<String> = failures
         .iter()
         .map(|f| {
@@ -268,7 +263,7 @@ pub fn call_proc_args_sync(
     }
 
     if !failures.is_empty() {
-        return Err(proc_validation_error(py, schema, proc_name, &failures));
+        return Err(proc_validation_error(schema, proc_name, &failures));
     }
 
     // 4. Ejecutar: result sets + OUT/INOUT leidos de los buffers.

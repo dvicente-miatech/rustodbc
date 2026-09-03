@@ -224,9 +224,9 @@ pub fn call_proc_args_sync(
     let items: Vec<Bound<'_, PyAny>> = if params.is_none() {
         Vec::new()
     } else if let Ok(list) = params.downcast::<PyList>() {
-        list.iter().collect::<PyResult<Vec<_>>>()?
+        list.iter().collect()
     } else if let Ok(tuple) = params.downcast::<PyTuple>() {
-        tuple.iter().collect::<PyResult<Vec<_>>>()?
+        tuple.iter().collect()
     } else {
         return Err(to_py_err(CoreError::Parameter(
             "call_proc_args: params debe ser una secuencia posicional (list/tuple) u None; \

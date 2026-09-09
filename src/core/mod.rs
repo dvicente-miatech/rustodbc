@@ -232,7 +232,14 @@ impl ProcParamBuffer {
         } else {
             ((ind as usize) / std::mem::size_of::<u16>()).min(self._buf.len())
         };
-        Some(ffi::wchar::from_utf16_lossy(&self._buf[..units]))
+        // Defensivo: si el driver trunco (`ind` mas largo que el buffer) o no
+        // entrego longitud (`ind < 0`), el slice puede incluir el NUL de
+        // SQL_C_WCHAR al final -- recortar la cola de NULs antes de decodificar.
+        let end = match self._buf[..units].iter().rposition(|&u| u != 0) {
+            Some(i) => i + 1,
+            None => 0,
+        };
+        Some(ffi::wchar::from_utf16_lossy(&self._buf[..end]))
     }
 }
 
@@ -448,8 +455,14 @@ fn bind_proc_params(
 
         // El C++ (cursor.cpp) toma COLUMN_SIZE del catalogo, capa a [256, 64KB],
         // y bindea todo como texto. Aca lo mismo pero UTF-16.
+        //
+        // Off-by-one 0.7.0/0.7.1: el buffer se dimensionaba a `cap` u16 (=cap*2
+        // bytes) sin sitio para el NUL de SQL_C_WCHAR; el driver escribia
+        // cap-1 caracteres + NUL y read_out() devolvia el NUL pegado al texto
+        // (un CHAR(22) perdia su ultimo caracter). El +1 deja sitio al
+        // terminador; la longitud real se lee del indicador (read_out).
         let cap = p.column_size.clamp(1, 65536);
-        let mut buf = vec![0u16; cap];
+        let mut buf = vec![0u16; cap + 1];
         let mut indicator = Box::new(odbc_sys::Len::default());
 
         // Escribir el valor de entrada si lo hay (IN/INOUT); si no, NULL.

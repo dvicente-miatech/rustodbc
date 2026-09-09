@@ -77,6 +77,26 @@ pub enum SqlTypeFamily {
     Text,
 }
 
+/// Outcome de `exec_direct`/`execute`: separa "ejecuto y dejo result set
+/// abierto o afecto >= 1 fila" de "ejecuto sin afectar ninguna fila".
+///
+/// El driver *IBM i Access ODBC* devuelve `SQL_NO_DATA` (100) cuando un
+/// UPDATE/DELETE con search no afecta ninguna fila -- comportamiento
+/// documentado como habitual en drivers DB2/ODBC (la spec de ODBC dice que
+/// deberia ser SUCCESS con rowcount 0, pero hay drivers que no lo cumplen).
+/// `SQL_NO_DATA` NO es un error: el driver no deja diagnosticos, y mapearlo
+/// como error producia el placeholder HY000 "el driver no dejo diagnostico"
+/// en vez de devolver rowcount 0 (verificado contra DEV en rustodbc 0.7.0).
+/// El llamador decide que hacer con `NoData` -- `Lease::execute` lo traduce
+/// a rowcount 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecOutcome {
+    /// Ejecuto y dejo un result set abierto o afecto >= 1 fila.
+    Executed,
+    /// Ejecuto sin afectar ninguna fila (`SQL_NO_DATA` del driver).
+    NoData,
+}
+
 pub fn classify_sql_type(sql_type: i16) -> SqlTypeFamily {
     match sql_type {
         t if t == SqlDataType::NUMERIC.0 || t == SqlDataType::DECIMAL.0 => SqlTypeFamily::Decimal,
@@ -148,10 +168,31 @@ impl RawStatement {
         Err(CoreError::from_diagnostic(diag))
     }
 
-    pub fn exec_direct(&self, sql: &str) -> Result<(), CoreError> {
+    /// Clasifica el retorno de una ejecucion (`SQLExecDirectW`/`SQLExecute`).
+    ///
+    /// `SQL_NO_DATA` = "ejecuto sin afectar filas" (quirk del driver IBM i
+    /// Access ODBC, ver `ExecOutcome`): NO es un error y no debe fabricar el
+    /// placeholder HY000. Todo lo demas que no sea SUCCESS pasa por `check`
+    /// (que junta los diagnosticos del statement, o el placeholder si el
+    /// driver no dejo ninguno).
+    fn classify_exec(&self, ret: SqlReturn) -> Result<ExecOutcome, CoreError> {
+        match ret {
+            SqlReturn::SUCCESS | SqlReturn::SUCCESS_WITH_INFO => Ok(ExecOutcome::Executed),
+            SqlReturn::NO_DATA => Ok(ExecOutcome::NoData),
+            _ => {
+                self.check(ret)?;
+                Ok(ExecOutcome::Executed)
+            }
+        }
+    }
+
+    /// `SQLExecDirectW`. `Ok(ExecOutcome::NoData)` = ejecuto sin afectar filas
+    /// (UPDATE/DELETE que matcheo 0 filas en el driver IBM i) -- ver
+    /// `ExecOutcome`.
+    pub fn exec_direct(&self, sql: &str) -> Result<ExecOutcome, CoreError> {
         let sql_u16 = to_utf16(sql);
         let ret = unsafe { SQLExecDirectW(self.hstmt, sql_u16.as_ptr(), utf16_len(sql) as i32) };
-        self.check(ret)
+        self.classify_exec(ret)
     }
 
     pub fn prepare(&self, sql: &str) -> Result<(), CoreError> {
@@ -160,9 +201,11 @@ impl RawStatement {
         self.check(ret)
     }
 
-    pub fn execute(&self) -> Result<(), CoreError> {
+    /// `SQLExecute` sobre un statement ya preparado. Mismo criterio que
+    /// `exec_direct`: `SQL_NO_DATA` = 0 filas afectadas, no es error.
+    pub fn execute(&self) -> Result<ExecOutcome, CoreError> {
         let ret = unsafe { SQLExecute(self.hstmt) };
-        self.check(ret)
+        self.classify_exec(ret)
     }
 
     pub fn num_result_cols(&self) -> Result<i16, CoreError> {

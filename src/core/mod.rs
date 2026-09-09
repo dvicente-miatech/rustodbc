@@ -641,10 +641,14 @@ impl Lease {
     pub fn execute(&self, sql: &str, params: &[ParamValue]) -> Result<i64, CoreError> {
         let stmt = RawStatement::alloc(self.hdbc())?;
         let _buffers = bind_params(&stmt, params)?;
-        stmt.exec_direct(sql)?;
-        // Statements sin result set (INSERT/UPDATE/DELETE) o con: en ambos
-        // casos SQLRowCount es valido segun la especificacion ODBC.
-        stmt.row_count()
+        match stmt.exec_direct(sql)? {
+            // El driver IBM i Access ODBC devuelve SQL_NO_DATA para un
+            // UPDATE/DELETE que afecta 0 filas (no es un error; ver
+            // `ExecOutcome` en core::ffi::stmt). Se traduce a rowcount 0 sin
+            // depender de SQLRowCount despues de un NO_DATA.
+            ffi::stmt::ExecOutcome::NoData => Ok(0),
+            ffi::stmt::ExecOutcome::Executed => stmt.row_count(),
+        }
     }
 
     /// Ejecuta `sql` y trae TODAS las filas en memoria de una. Usado por

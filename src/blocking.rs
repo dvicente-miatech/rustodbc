@@ -366,10 +366,13 @@ impl BlockingEngine {
             self.block_on(async move { engine.acquire().await.map_err(to_py_err) })
         })?;
 
-        // Metadata con el GIL liberado.
-        let metadata: Vec<ProcParam> = py
-            .allow_threads(|| lease.proc_columns(&schema, &proc))
-            .map_err(to_py_err)?;
+        // Metadata con el GIL liberado. El `Lease` se mueve al closure y se
+        // recupera: `allow_threads` exige capturas `Send` y `Lease` no es
+        // `Sync` (no puede capturarse por referencia).
+        let (lease, metadata) = py.allow_threads(|| {
+            let metadata = lease.proc_columns(&schema, &proc).map_err(to_py_err)?;
+            Ok::<_, PyErr>((lease, metadata))
+        })?;
         if metadata.is_empty() {
             return Err(to_py_err(CoreError::Parameter(format!(
                 "call_proc: no se encontro el procedimiento {schema}.{proc} en el catalogo \
@@ -398,10 +401,13 @@ impl BlockingEngine {
             crate::proc::resolve_named_values(py, input.as_ref(), &metadata)?
         };
 
-        // Cursor con el GIL liberado.
-        let cursor = py
-            .allow_threads(|| lease.call_proc_cursor(&schema, &proc, &metadata, &values))
-            .map_err(to_py_err)?;
+        // Cursor con el GIL liberado (mismo motivo: `Lease` no es `Sync`).
+        let (lease, cursor) = py.allow_threads(|| {
+            let cursor = lease
+                .call_proc_cursor(&schema, &proc, &metadata, &values)
+                .map_err(to_py_err)?;
+            Ok::<_, PyErr>((lease, cursor))
+        })?;
 
         let runtime = self.runtime.handle().clone();
         Py::new(
@@ -431,9 +437,13 @@ impl BlockingEngine {
             self.block_on(async move { engine.acquire().await.map_err(to_py_err) })
         })?;
 
-        let metadata: Vec<ProcParam> = py
-            .allow_threads(|| lease.proc_columns(&schema, &proc))
-            .map_err(to_py_err)?;
+        // Metadata con el GIL liberado. El `Lease` se mueve al closure y se
+        // recupera: `allow_threads` exige capturas `Send` y `Lease` no es
+        // `Sync` (no puede capturarse por referencia).
+        let (lease, metadata) = py.allow_threads(|| {
+            let metadata = lease.proc_columns(&schema, &proc).map_err(to_py_err)?;
+            Ok::<_, PyErr>((lease, metadata))
+        })?;
         if metadata.is_empty() {
             return Err(to_py_err(CoreError::Parameter(format!(
                 "call_proc_args: no se encontro el procedimiento {schema}.{proc} en el catalogo \
@@ -452,9 +462,13 @@ impl BlockingEngine {
             Some(p) => crate::proc::resolve_positional_values(py, &p, &metadata, &schema, &proc)?,
         };
 
-        let cursor = py
-            .allow_threads(|| lease.call_proc_cursor(&schema, &proc, &metadata, &values))
-            .map_err(to_py_err)?;
+        // Cursor con el GIL liberado (mismo motivo: `Lease` no es `Sync`).
+        let (lease, cursor) = py.allow_threads(|| {
+            let cursor = lease
+                .call_proc_cursor(&schema, &proc, &metadata, &values)
+                .map_err(to_py_err)?;
+            Ok::<_, PyErr>((lease, cursor))
+        })?;
 
         let runtime = self.runtime.handle().clone();
         Py::new(

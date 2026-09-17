@@ -304,11 +304,15 @@ pub fn call_proc_sync(
     let input_bound: Option<Bound<'_, PyDict>> = input_owned.as_ref().map(|d| d.bind(py).clone());
     let values = resolve_named_values(py, input_bound.as_ref(), &metadata)?;
 
-    // 3. Cursor del CALL, con el GIL liberado (bind + exec bloqueantes).
-    let mut cursor = py.allow_threads(|| {
-        lease
+    // 3. Cursor del CALL, con el GIL liberado (bind + exec bloqueantes). El
+    //    `Lease` se mueve al closure y se recupera: `allow_threads` exige
+    //    capturas `Send` y `Lease` es `Send` pero no `Sync` (no puede
+    //    capturarse por referencia).
+    let (_lease, mut cursor) = py.allow_threads(|| {
+        let cursor = lease
             .call_proc_cursor(schema, proc_name, &metadata, &values)
-            .map_err(to_py_err)
+            .map_err(to_py_err)?;
+        Ok::<_, PyErr>((lease, cursor))
     })?;
 
     // 4. Drenar por lotes (fetch sin GIL, conversion con GIL).
@@ -404,11 +408,13 @@ pub fn call_proc_args_sync(
     // 2-3. Validar aridad + tipos (todos los fallos juntos).
     let values = resolve_positional_items(py, &items, &metadata, schema, proc_name)?;
 
-    // 4. Cursor del CALL, con el GIL liberado.
-    let mut cursor = py.allow_threads(|| {
-        lease
+    // 4. Cursor del CALL, con el GIL liberado (mismo motivo que arriba: el
+    //    `Lease` es `Send` pero no `Sync`, se mueve y se recupera).
+    let (_lease, mut cursor) = py.allow_threads(|| {
+        let cursor = lease
             .call_proc_cursor(schema, proc_name, &metadata, &values)
-            .map_err(to_py_err)
+            .map_err(to_py_err)?;
+        Ok::<_, PyErr>((lease, cursor))
     })?;
 
     // 5. Drenar por lotes.

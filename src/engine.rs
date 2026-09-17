@@ -295,6 +295,136 @@ pub(crate) async fn call_proc_args_impl(
     .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
 }
 
+/// Streaming de un `CALL` con params por NOMBRE: valida eager (metadata +
+/// dict) y devuelve un `ProcStream` de `(set_index, list[Row])`. Los
+/// OUT/INOUT quedan en `stream.out_params` tras agotar.
+pub(crate) async fn call_proc_stream_impl(
+    engine: SharedEngine,
+    options: EngineOptions,
+    schema: String,
+    proc: String,
+    params: Py<PyAny>,
+    batch_size: usize,
+) -> PyResult<Py<crate::proc_stream::ProcStream>> {
+    use pyo3::types::PyDict;
+
+    let lease = engine.acquire().await.map_err(to_py_err)?;
+    let schema_for_meta = schema.clone();
+    let proc_for_meta = proc.clone();
+    let (lease, metadata) = tokio::task::spawn_blocking(move || {
+        let metadata = lease
+            .proc_columns(&schema_for_meta, &proc_for_meta)
+            .map_err(to_py_err)?;
+        Ok::<_, PyErr>((lease, metadata))
+    })
+    .await
+    .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))??;
+    if metadata.is_empty() {
+        return Err(to_py_err(crate::errors::CoreError::Parameter(format!(
+            "call_proc: no se encontro el procedimiento {schema}.{proc} en el catalogo \
+             (o no tiene parametros)"
+        ))));
+    }
+
+    // Resolver el dict con GIL (eager: el error sale en el call, no iterando).
+    let values = Python::with_gil(|py| {
+        let bound = params.bind(py);
+        let input: Option<Bound<'_, PyDict>> = if bound.is_none() {
+            None
+        } else {
+            let dict = bound.downcast::<PyDict>().map_err(|_| {
+                to_py_err(crate::errors::CoreError::Parameter(
+                    "call_proc: params debe ser un dict {nombre: valor} (o None)".to_string(),
+                ))
+            })?;
+            Some(dict.clone())
+        };
+        crate::proc::resolve_named_values(py, input.as_ref(), &metadata)
+    })?;
+
+    let metadata_for_cursor = metadata.clone();
+    let (lease, cursor) = tokio::task::spawn_blocking(move || {
+        let cursor = lease
+            .call_proc_cursor(&schema, &proc, &metadata_for_cursor, &values)
+            .map_err(to_py_err)?;
+        Ok::<_, PyErr>((lease, cursor))
+    })
+    .await
+    .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))??;
+
+    let prefetch = options.prefetch_batches;
+    Python::with_gil(|py| {
+        Py::new(
+            py,
+            crate::proc_stream::ProcStream::new(
+                lease, cursor, metadata, batch_size, prefetch, options,
+            ),
+        )
+    })
+}
+
+/// Streaming de un `CALL` posicional (`call_proc_args`): misma vida que
+/// `call_proc_stream_impl` pero con validacion `ProcValidationError` eager.
+pub(crate) async fn call_proc_args_stream_impl(
+    engine: SharedEngine,
+    options: EngineOptions,
+    schema: String,
+    proc: String,
+    params: Py<PyAny>,
+    batch_size: usize,
+) -> PyResult<Py<crate::proc_stream::ProcStream>> {
+    let lease = engine.acquire().await.map_err(to_py_err)?;
+    let schema_for_meta = schema.clone();
+    let proc_for_meta = proc.clone();
+    let (lease, metadata) = tokio::task::spawn_blocking(move || {
+        let metadata = lease
+            .proc_columns(&schema_for_meta, &proc_for_meta)
+            .map_err(to_py_err)?;
+        Ok::<_, PyErr>((lease, metadata))
+    })
+    .await
+    .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))??;
+    if metadata.is_empty() {
+        return Err(to_py_err(crate::errors::CoreError::Parameter(format!(
+            "call_proc_args: no se encontro el procedimiento {schema}.{proc} en el catalogo \
+             (o no tiene parametros)"
+        ))));
+    }
+
+    let schema_for_resolve = schema.clone();
+    let proc_for_resolve = proc.clone();
+    let values = Python::with_gil(|py| {
+        let bound = params.bind(py);
+        crate::proc::resolve_positional_values(
+            py,
+            bound,
+            &metadata,
+            &schema_for_resolve,
+            &proc_for_resolve,
+        )
+    })?;
+
+    let metadata_for_cursor = metadata.clone();
+    let (lease, cursor) = tokio::task::spawn_blocking(move || {
+        let cursor = lease
+            .call_proc_cursor(&schema, &proc, &metadata_for_cursor, &values)
+            .map_err(to_py_err)?;
+        Ok::<_, PyErr>((lease, cursor))
+    })
+    .await
+    .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))??;
+
+    let prefetch = options.prefetch_batches;
+    Python::with_gil(|py| {
+        Py::new(
+            py,
+            crate::proc_stream::ProcStream::new(
+                lease, cursor, metadata, batch_size, prefetch, options,
+            ),
+        )
+    })
+}
+
 #[pyclass(module = "rustodbc")]
 pub struct Db2iEngine {
     pub(crate) engine: SharedEngine,
@@ -617,6 +747,59 @@ impl Db2iEngine {
         pyo3_async_runtimes::tokio::future_into_py(
             py,
             call_proc_args_impl(engine, schema, proc, params_owned, strip, decimal_mode),
+        )
+    }
+
+    /// Streaming de un `CALL` con params por NOMBRE (`dict`): devuelve un
+    /// `ProcStream` que itera `(set_index, list[Row])` por lotes sin
+    /// materializar todos los result sets. Los OUT/INOUT quedan en
+    /// `stream.out_params` tras agotar. La metadata y el dict se validan
+    /// eager (en el call, no iterando).
+    #[pyo3(signature = (schema, proc, params=None, batch_size=None))]
+    fn call_proc_stream<'py>(
+        &self,
+        py: Python<'py>,
+        schema: String,
+        proc: String,
+        params: Option<Bound<'py, PyAny>>,
+        batch_size: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let params_owned: Py<PyAny> = match params {
+            Some(p) => p.unbind(),
+            None => py.None(),
+        };
+        let engine = self.engine.clone();
+        let options = self.options.clone();
+        let batch_size = batch_size.unwrap_or(options.stream_batch_size).max(1);
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            call_proc_stream_impl(engine, options, schema, proc, params_owned, batch_size),
+        )
+    }
+
+    /// Streaming de un `CALL` POSICIONAL (`list`/`tuple` en orden ordinal):
+    /// devuelve un `ProcStream` de `(set_index, list[Row])`. Valida eager
+    /// contra el catalogo (`ProcValidationError` en el call); los OUT/INOUT
+    /// quedan en `stream.out_params` tras agotar.
+    #[pyo3(signature = (schema, proc, params=None, batch_size=None))]
+    fn call_proc_args_stream<'py>(
+        &self,
+        py: Python<'py>,
+        schema: String,
+        proc: String,
+        params: Option<Bound<'py, PyAny>>,
+        batch_size: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let params_owned: Py<PyAny> = match params {
+            Some(p) => p.unbind(),
+            None => py.None(),
+        };
+        let engine = self.engine.clone();
+        let options = self.options.clone();
+        let batch_size = batch_size.unwrap_or(options.stream_batch_size).max(1);
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            call_proc_args_stream_impl(engine, options, schema, proc, params_owned, batch_size),
         )
     }
 

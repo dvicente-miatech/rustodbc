@@ -14,5 +14,6 @@ Uso:
 
 from ._rustodbc import BlockingBatchStream as BlockingBatchStream
 from ._rustodbc import BlockingEngine as BlockingEngine
+from ._rustodbc import BlockingProcStream as BlockingProcStream
 
-__all__ = ["BlockingEngine", "BlockingBatchStream"]
+__all__ = ["BlockingEngine", "BlockingBatchStream", "BlockingProcStream"]

@@ -28,6 +28,7 @@ pub mod engine;
 pub mod params;
 pub mod pool;
 pub mod proc;
+pub mod proc_stream;
 pub mod rows;
 pub mod stream;
 #[cfg(feature = "tablesync")]
@@ -54,6 +55,7 @@ fn rustodbc_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<stream::BatchStream>()?;
     m.add_class::<blocking::BlockingEngine>()?;
     m.add_class::<blocking::BlockingBatchStream>()?;
+    m.add_class::<blocking::BlockingProcStream>()?;
 
     m.add_class::<bulk::BulkReport>()?;
     m.add_class::<bulk::TaskFailure>()?;
@@ -61,6 +63,7 @@ fn rustodbc_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bulk::plan_concurrency, m)?)?;
 
     m.add_class::<proc::ProcResult>()?;
+    m.add_class::<proc_stream::ProcStream>()?;
 
     #[cfg(feature = "tablesync")]
     {

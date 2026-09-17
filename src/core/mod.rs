@@ -610,6 +610,115 @@ impl RowCursor {
 }
 
 // ---------------------------------------------------------------------------
+// ProcCursor -- cursor multi-result-set para CALL con OUT/INOUT
+// ---------------------------------------------------------------------------
+
+/// Cursor de un `CALL schema.proc(?,...)` en curso. A diferencia de
+/// `RowCursor` (un solo result set), un procedimiento puede devolver N result
+/// sets via `SQLMoreResults`, y los OUT/INOUT solo son validos despues de
+/// drenar TODOS los sets (spec ODBC: `SQLMoreResults` -> `SQL_NO_DATA`).
+///
+/// Los `ProcParamBuffer` se sostienen vivos en `buffers` hasta que `advance()`
+/// agota el ultimo set y lee los OUT a `out_params`. `set_index` cuenta solo
+/// sets ENTREGADOS (con columnas, igual que `ProcResult.result_sets`): los
+/// sets vacios (0 columnas) se saltan tanto al posicionar como al avanzar,
+/// paridad exacta con el `Lease::call_proc` historico.
+pub struct ProcCursor {
+    stmt: RawStatement,
+    buffers: Vec<ProcParamBuffer>,
+    out_indices: Vec<usize>,
+    columns: Vec<ColumnMeta>,
+    set_index: usize,
+    all_done: bool,
+    out_params: Option<ProcOutParams>,
+}
+
+impl ProcCursor {
+    /// Indice (0-based) del result set actual entre los entregados.
+    pub fn set_index(&self) -> usize {
+        self.set_index
+    }
+
+    /// `true` cuando ya se drenaron todos los sets y se leyeron los OUT.
+    pub fn is_done(&self) -> bool {
+        self.all_done
+    }
+
+    /// Metadata del result set actual (vacia si `is_done()`).
+    pub fn current_columns(&self) -> &[ColumnMeta] {
+        &self.columns
+    }
+
+    pub fn column_names(&self) -> Vec<String> {
+        self.columns.iter().map(|c| c.name.clone()).collect()
+    }
+
+    pub fn column_metas(&self) -> Vec<ColumnMeta> {
+        self.columns.clone()
+    }
+
+    /// Trae hasta `max_rows` filas del set ACTUAL. `Vec` vacio = set actual
+    /// agotado (no proc agotado: llamar `advance()` para pasar al siguiente).
+    pub fn fetch_batch(&mut self, max_rows: usize) -> Result<Vec<Vec<ColumnValue>>, CoreError> {
+        if self.all_done || max_rows == 0 {
+            return Ok(Vec::new());
+        }
+        let mut batch = Vec::with_capacity(max_rows);
+        for _ in 0..max_rows {
+            if !self.stmt.fetch()? {
+                break;
+            }
+            batch.push(fetch_row(&self.stmt, &self.columns)?);
+        }
+        Ok(batch)
+    }
+
+    /// Avanza al siguiente result set con columnas. `Ok(true)` = hay otro
+    /// set (actualiza `current_columns` + `set_index`); `Ok(false)` = no hay
+    /// mas (marca `all_done` y lee los OUT/INOUT de los buffers).
+    pub fn advance(&mut self) -> Result<bool, CoreError> {
+        if self.all_done {
+            return Ok(false);
+        }
+        loop {
+            if !self.stmt.more_results()? {
+                self.finish_out();
+                return Ok(false);
+            }
+            let columns = describe_columns(&self.stmt).unwrap_or_default();
+            if columns.is_empty() {
+                continue;
+            }
+            self.columns = columns;
+            self.set_index += 1;
+            return Ok(true);
+        }
+    }
+
+    /// OUT/INOUT leidos al agotar (`Some` solo tras `advance()` -> `false`).
+    pub fn take_out_params(&mut self) -> Option<ProcOutParams> {
+        self.out_params.take()
+    }
+
+    /// `SQLCancel` sobre el statement -- seguro desde otro hilo. La conexion
+    /// asociada se descarta del pool despues de esto (regla AGENTS.md ss4).
+    pub fn cancel(&self) -> Result<(), CoreError> {
+        self.stmt.cancel()
+    }
+
+    fn finish_out(&mut self) {
+        let mut out = Vec::with_capacity(self.out_indices.len());
+        for &i in &self.out_indices {
+            let text = self.buffers.get(i).and_then(|b| b.read_out());
+            out.push((i, text));
+        }
+        self.columns = Vec::new();
+        self.all_done = true;
+        self.out_params = Some(out);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Lease -- una conexion arrendada del pool
 // ---------------------------------------------------------------------------
 
@@ -748,10 +857,76 @@ impl Lease {
         Ok(params)
     }
 
+    /// Ejecuta un `CALL schema.proc(?,...)` y devuelve un `ProcCursor` para
+    /// drenarlo por lotes sin materializar todos los result sets en memoria.
+    /// Los OUT/INOUT se leen solos cuando `advance()` agota el ultimo set.
+    ///
+    /// `metadata` es el resultado de `proc_columns` (mismo orden); `values`
+    /// son los valores de entrada por posicion (`None` = NULL de entrada; los
+    /// OUT pueden ir como `None` sin problema -- el driver escribe el
+    /// resultado).
+    pub fn call_proc_cursor(
+        &self,
+        schema: &str,
+        proc_name: &str,
+        metadata: &[ProcParam],
+        values: &[Option<ParamValue>],
+    ) -> Result<ProcCursor, CoreError> {
+        let placeholders = vec!["?"; metadata.len()].join(",");
+        let sql = format!("{{CALL {schema}.{proc_name}({placeholders})}}");
+
+        let stmt = RawStatement::alloc(self.hdbc())?;
+        let buffers = bind_proc_params(&stmt, metadata, values)?;
+        stmt.exec_direct(&sql)?;
+
+        let out_indices: Vec<usize> = metadata
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.io_type == ffi::stmt::SQL_PARAM_OUTPUT
+                    || p.io_type == ffi::stmt::SQL_PARAM_INPUT_OUTPUT
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut cursor = ProcCursor {
+            stmt,
+            buffers,
+            out_indices,
+            columns: Vec::new(),
+            set_index: 0,
+            all_done: false,
+            out_params: None,
+        };
+
+        // Posicionar en el primer set con columnas (los vacios se saltan,
+        // paridad con `call_proc` historico que solo pusheaba non-empty).
+        let first = describe_columns(&cursor.stmt).unwrap_or_default();
+        if !first.is_empty() {
+            cursor.columns = first;
+            return Ok(cursor);
+        }
+        loop {
+            if !cursor.stmt.more_results()? {
+                cursor.finish_out();
+                return Ok(cursor);
+            }
+            let columns = describe_columns(&cursor.stmt).unwrap_or_default();
+            if !columns.is_empty() {
+                cursor.columns = columns;
+                return Ok(cursor);
+            }
+        }
+    }
+
     /// Ejecuta un `CALL schema.proc(?,...)` con bindeo por tipo de I/O
     /// (IN/INOUT/OUT) y trae:
     /// - todos los result sets (multiples via `SQLMoreResults`), y
     /// - los valores OUT/INOUT leidos de los buffers despues de ejecutar.
+    ///
+    /// Implementado sobre `call_proc_cursor` (un solo camino): drena set por
+    /// set acumulando en `Vec`. Los llamadores que quieran pico de RAM bajo
+    /// usan el cursor directo por lotes en vez de esta funcion.
     ///
     /// `metadata` es el resultado de `proc_columns` (mismo orden); `values`
     /// son los valores de entrada por posicion (`None` = NULL de entrada; los
@@ -765,38 +940,30 @@ impl Lease {
         metadata: &[ProcParam],
         values: &[Option<ParamValue>],
     ) -> Result<(CallResult, ProcOutParams), CoreError> {
-        let placeholders = vec!["?"; metadata.len()].join(",");
-        let sql = format!("{{CALL {schema}.{proc_name}({placeholders})}}");
-
-        let stmt = RawStatement::alloc(self.hdbc())?;
-        let buffers = bind_proc_params(&stmt, metadata, values)?;
-        stmt.exec_direct(&sql)?;
-
+        let mut cursor = self.call_proc_cursor(schema, proc_name, metadata, values)?;
         let mut result_sets = Vec::new();
-        loop {
-            let columns = describe_columns(&stmt).unwrap_or_default();
-            if !columns.is_empty() {
-                let mut rows = Vec::new();
-                while stmt.fetch()? {
-                    rows.push(fetch_row(&stmt, &columns)?);
+        while !cursor.is_done() {
+            let columns = cursor.current_columns().to_vec();
+            if columns.is_empty() {
+                if !cursor.advance()? {
+                    break;
                 }
-                result_sets.push((columns, rows));
+                continue;
             }
-            if !stmt.more_results()? {
+            let mut rows = Vec::new();
+            loop {
+                let batch = cursor.fetch_batch(5000)?;
+                if batch.is_empty() {
+                    break;
+                }
+                rows.extend(batch);
+            }
+            result_sets.push((columns, rows));
+            if !cursor.advance()? {
                 break;
             }
         }
-
-        // Leer OUT/INOUT de los buffers (que `bind_proc_params` mantuvo vivos).
-        let mut out_params = Vec::new();
-        for (i, p) in metadata.iter().enumerate() {
-            if p.io_type == ffi::stmt::SQL_PARAM_OUTPUT
-                || p.io_type == ffi::stmt::SQL_PARAM_INPUT_OUTPUT
-            {
-                out_params.push((i, buffers[i].read_out()));
-            }
-        }
-
+        let out_params = cursor.take_out_params().unwrap_or_default();
         Ok((result_sets, out_params))
     }
 }

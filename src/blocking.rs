@@ -20,6 +20,7 @@ use secrecy::SecretString;
 
 use crate::config::{Credentials, EngineOptions};
 use crate::core::{Lease, ParamValue, SharedEngine};
+use crate::core::{ProcOutParams, ProcParam};
 use crate::engine::{
     batch_execute_impl, call_proc_args_impl, call_proc_impl, connect_impl, execute_impl,
     executebatch_impl, fetch_all_impl, fetch_column_impl, fetch_one_impl, fetch_value_impl,
@@ -342,6 +343,126 @@ impl BlockingEngine {
         })
     }
 
+    /// Streaming sync de un `CALL` con params por NOMBRE: devuelve un
+    /// `BlockingProcStream` iterable de `(set_index, list[Row])` por lotes.
+    /// Los OUT/INOUT quedan en `stream.out_params` tras agotar.
+    #[pyo3(signature = (schema, proc, params=None, batch_size=None))]
+    fn call_proc_stream(
+        &self,
+        py: Python<'_>,
+        schema: String,
+        proc: String,
+        params: Option<Bound<'_, PyAny>>,
+        batch_size: Option<usize>,
+    ) -> PyResult<Py<BlockingProcStream>> {
+        use pyo3::types::PyDict;
+        check_no_running_loop(py)?;
+        let engine = self.engine.clone();
+        let options = self.options.clone();
+        let batch_size = batch_size.unwrap_or(options.stream_batch_size).max(1);
+
+        // Lease con el GIL liberado.
+        let lease: Lease = py.allow_threads(move || {
+            self.block_on(async move { engine.acquire().await.map_err(to_py_err) })
+        })?;
+
+        // Metadata con el GIL liberado.
+        let metadata: Vec<ProcParam> = py
+            .allow_threads(|| lease.proc_columns(&schema, &proc))
+            .map_err(to_py_err)?;
+        if metadata.is_empty() {
+            return Err(to_py_err(CoreError::Parameter(format!(
+                "call_proc: no se encontro el procedimiento {schema}.{proc} en el catalogo \
+                 (o no tiene parametros)"
+            ))));
+        }
+
+        // Dict -> valores (con GIL, eager).
+        let values = {
+            let input: Option<Bound<'_, PyDict>> = match params {
+                None => None,
+                Some(p) => {
+                    if p.is_none() {
+                        None
+                    } else {
+                        let dict = p.downcast::<PyDict>().map_err(|_| {
+                            to_py_err(CoreError::Parameter(
+                                "call_proc: params debe ser un dict {nombre: valor} (o None)"
+                                    .to_string(),
+                            ))
+                        })?;
+                        Some(dict.clone())
+                    }
+                }
+            };
+            crate::proc::resolve_named_values(py, input.as_ref(), &metadata)?
+        };
+
+        // Cursor con el GIL liberado.
+        let cursor = py
+            .allow_threads(|| lease.call_proc_cursor(&schema, &proc, &metadata, &values))
+            .map_err(to_py_err)?;
+
+        let runtime = self.runtime.handle().clone();
+        Py::new(
+            py,
+            BlockingProcStream::new(lease, cursor, metadata, batch_size, options, runtime),
+        )
+    }
+
+    /// Streaming sync de un `CALL` POSICIONAL: devuelve un
+    /// `BlockingProcStream` de `(set_index, list[Row])`. Valida eager
+    /// (`ProcValidationError` en el call); OUT en `out_params` tras agotar.
+    #[pyo3(signature = (schema, proc, params=None, batch_size=None))]
+    fn call_proc_args_stream(
+        &self,
+        py: Python<'_>,
+        schema: String,
+        proc: String,
+        params: Option<Bound<'_, PyAny>>,
+        batch_size: Option<usize>,
+    ) -> PyResult<Py<BlockingProcStream>> {
+        check_no_running_loop(py)?;
+        let engine = self.engine.clone();
+        let options = self.options.clone();
+        let batch_size = batch_size.unwrap_or(options.stream_batch_size).max(1);
+
+        let lease: Lease = py.allow_threads(move || {
+            self.block_on(async move { engine.acquire().await.map_err(to_py_err) })
+        })?;
+
+        let metadata: Vec<ProcParam> = py
+            .allow_threads(|| lease.proc_columns(&schema, &proc))
+            .map_err(to_py_err)?;
+        if metadata.is_empty() {
+            return Err(to_py_err(CoreError::Parameter(format!(
+                "call_proc_args: no se encontro el procedimiento {schema}.{proc} en el catalogo \
+                 (o no tiene parametros)"
+            ))));
+        }
+
+        let values = match params {
+            None => crate::proc::resolve_positional_values(
+                py,
+                &py.None().bind(py).clone(),
+                &metadata,
+                &schema,
+                &proc,
+            )?,
+            Some(p) => crate::proc::resolve_positional_values(py, &p, &metadata, &schema, &proc)?,
+        };
+
+        let cursor = py
+            .allow_threads(|| lease.call_proc_cursor(&schema, &proc, &metadata, &values))
+            .map_err(to_py_err)?;
+
+        let runtime = self.runtime.handle().clone();
+        Py::new(
+            py,
+            BlockingProcStream::new(lease, cursor, metadata, batch_size, options, runtime),
+        )
+    }
+
     #[cfg(feature = "tablesync")]
     #[pyo3(signature = (source=None))]
     fn table_sync<'py>(
@@ -449,5 +570,201 @@ impl BlockingBatchStream {
             options.strip_char_padding,
             &options.decimal_mode,
         )
+    }
+}
+
+/// Resultado de avanzar de result set dentro del hilo bloqueante (mismo
+/// patron que `proc_stream::AdvOutcome`; evita tuplas anidadas y closures
+/// invocadas al toque).
+enum BlockingAdvance {
+    More {
+        index: usize,
+        columns: Vec<crate::core::ffi::ColumnMeta>,
+        names: Vec<String>,
+    },
+    Finished(ProcOutParams),
+}
+
+/// Iterador sincrono por lotes sobre un `CALL` multi-result-set. Itera
+/// `(set_index, list[Row])`; los sets vacios se saltan. `out_params` estricto
+/// tras agotar. RAM acotada a un lote (el cursor nunca materializa todo).
+#[pyclass(module = "rustodbc")]
+pub struct BlockingProcStream {
+    cursor: Option<(Lease, crate::core::ProcCursor)>,
+    metadata: Vec<ProcParam>,
+    batch_size: usize,
+    options: EngineOptions,
+    runtime: tokio::runtime::Handle,
+    current_columns_meta: Vec<crate::core::ffi::ColumnMeta>,
+    current_columns: Vec<String>,
+    current_set_index: usize,
+    out_params: Option<ProcOutParams>,
+    done: bool,
+}
+
+impl BlockingProcStream {
+    fn new(
+        lease: Lease,
+        cursor: crate::core::ProcCursor,
+        metadata: Vec<ProcParam>,
+        batch_size: usize,
+        options: EngineOptions,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        let current_columns = cursor.column_names();
+        let current_columns_meta = cursor.column_metas();
+        let current_set_index = cursor.set_index();
+        BlockingProcStream {
+            cursor: Some((lease, cursor)),
+            metadata,
+            batch_size: batch_size.max(1),
+            options,
+            runtime,
+            current_columns_meta,
+            current_columns,
+            current_set_index,
+            out_params: None,
+            done: false,
+        }
+    }
+}
+
+#[pymethods]
+impl BlockingProcStream {
+    /// Columnas del result set actual.
+    #[getter]
+    fn columns(&self) -> Vec<String> {
+        self.current_columns.clone()
+    }
+
+    /// Indice (0-based) del result set actual entre los entregados.
+    #[getter]
+    fn set_index(&self) -> usize {
+        self.current_set_index
+    }
+
+    /// OUT/INOUT del procedimiento. Solo tras agotar; si no, `InterfaceError`.
+    #[getter]
+    fn out_params(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
+        let Some(out) = (if self.done {
+            self.out_params.clone()
+        } else {
+            None
+        }) else {
+            return Err(to_py_err(CoreError::Interface(
+                "call_proc_stream: out_params solo disponible tras agotar el stream \
+                 (drenar todos los result sets)"
+                    .to_string(),
+            )));
+        };
+        crate::proc::out_params_to_pydict(
+            py,
+            &self.metadata,
+            &out,
+            self.options.strip_char_padding,
+            &self.options.decimal_mode,
+        )
+    }
+
+    /// Cierra el stream sin agotar: libera el statement y devuelve la
+    /// conexion al pool. `out_params` queda no disponible (estricto).
+    fn close(&mut self) {
+        self.done = true;
+        self.cursor = None;
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        use pyo3::types::PyTuple;
+
+        if self.done {
+            return Err(PyStopIteration::new_err(()));
+        }
+        loop {
+            let Some((lease, cursor)) = self.cursor.take() else {
+                self.done = true;
+                return Err(PyStopIteration::new_err(()));
+            };
+
+            let batch_size = self.batch_size;
+            let runtime = self.runtime.clone();
+
+            // 1. Fetch del set actual (GIL liberado).
+            let (lease, cursor, batch) = py.allow_threads(move || {
+                runtime.block_on(async move {
+                    tokio::task::spawn_blocking(move || {
+                        let mut cursor = cursor;
+                        let batch = cursor.fetch_batch(batch_size);
+                        (lease, cursor, batch)
+                    })
+                    .await
+                    .map_err(|e| to_py_err(CoreError::Connect(format!("panic: {e}"))))
+                })
+            })?;
+            let batch = batch.map_err(to_py_err)?;
+            if !batch.is_empty() {
+                let columns_meta = self.current_columns_meta.clone();
+                let set_index = self.current_set_index;
+                let options = self.options.clone();
+                self.cursor = Some((lease, cursor));
+                let pylist = batch_to_pylist(
+                    py,
+                    &columns_meta,
+                    &batch,
+                    options.strip_char_padding,
+                    &options.decimal_mode,
+                )?;
+                let tuple = PyTuple::new_bound(py, [set_index.into_py(py), pylist.into_py(py)]);
+                return Ok(tuple.into_any().unbind());
+            }
+
+            // 2. Set agotado: avanzar (GIL liberado).
+            let runtime = self.runtime.clone();
+            let (lease, cursor, advanced) = py.allow_threads(move || {
+                runtime.block_on(async move {
+                    tokio::task::spawn_blocking(move || {
+                        let mut cursor = cursor;
+                        let res = match cursor.advance() {
+                            Err(e) => Err(e),
+                            Ok(true) => Ok(BlockingAdvance::More {
+                                index: cursor.set_index(),
+                                columns: cursor.column_metas(),
+                                names: cursor.column_names(),
+                            }),
+                            Ok(false) => {
+                                let out = cursor.take_out_params().unwrap_or_default();
+                                Ok(BlockingAdvance::Finished(out))
+                            }
+                        };
+                        (lease, cursor, res)
+                    })
+                    .await
+                    .map_err(|e| to_py_err(CoreError::Connect(format!("panic: {e}"))))
+                })
+            })?;
+            match advanced.map_err(to_py_err)? {
+                BlockingAdvance::More {
+                    index,
+                    columns,
+                    names,
+                } => {
+                    self.current_set_index = index;
+                    self.current_columns_meta = columns;
+                    self.current_columns = names;
+                    self.cursor = Some((lease, cursor));
+                    continue;
+                }
+                BlockingAdvance::Finished(out) => {
+                    self.out_params = Some(out);
+                    self.done = true;
+                    // Lease se dropea aca (vuelve al pool sano).
+                    drop((lease, cursor));
+                    return Err(PyStopIteration::new_err(()));
+                }
+            }
+        }
     }
 }

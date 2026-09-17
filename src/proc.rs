@@ -16,16 +16,35 @@
 //! catalogo (no desambigua por `SPECIFIC_NAME`); si el procedimiento no
 //! existe o no tiene parametros, `proc_columns` devuelve vacio y se falla con
 //! `ParameterError` claro antes de llamar.
+//!
+//! Memoria (palanca 1): el drenado NO materializa todos los result sets en
+//! Rust primero. Se usa `Lease::call_proc_cursor` y se trae por lotes
+//! (`PROC_FETCH_CHUNK` filas): cada lote se convierte a Python y el buffer
+//! Rust se libera antes del siguiente fetch. Pico ~= Python(todo) + 1 lote,
+//! en vez de Rust(todo) + Python(todo). El contrato (`ProcResult` con todo)
+//! no cambia -- solo el pico. Quien pueda procesar por lotes y descartar
+//! usa `call_proc_stream`/`call_proc_args_stream` (`proc_stream.rs`), donde
+//! la RAM no crece con el tamano.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::core::ffi::stmt::SQL_PARAM_OUTPUT;
 use crate::core::ffi::ColumnMeta;
-use crate::core::{validate_proc_param, ColumnValue, ParamValue, ProcParamError, SharedEngine};
+use crate::core::{
+    validate_proc_param, ColumnValue, ParamValue, ProcCursor, ProcOutParams, ProcParam,
+    SharedEngine,
+};
 use crate::errors::{to_py_err, CoreError, ProcValidationError};
 use crate::params::param_value_from_python;
 use crate::rows::{batch_to_pylist, column_value_to_py};
+
+/// Filas por lote al drenar un `CALL` en el camino sync (`ProcResult`).
+/// Solo acota el buffer Rust transitorio -- el resultado Python final igual
+/// contiene todo (ver doc del modulo). Suficientemente grande para no
+/// agregar viajes ODBC de mas, suficientemente chico para que el pico extra
+/// sea despreciable frente al resultado.
+pub(crate) const PROC_FETCH_CHUNK: usize = 5000;
 
 #[pyclass(module = "rustodbc")]
 pub struct ProcResult {
@@ -58,68 +77,119 @@ fn lookup_param(
     }
 }
 
-/// Convierte los parametros posicionales de Python (dict por nombre) y llama
-/// al procedimiento con bindeo OUT/INOUT. `params` es un dict o `None`;
-/// acepta tambien el prefijo `@` en el nombre del dict (como el C++).
-pub fn call_proc_sync(
-    engine: &SharedEngine,
-    schema: &str,
-    proc_name: &str,
-    params: &Bound<'_, PyAny>,
-    strip_char_padding: bool,
-    decimal_mode: &str,
-) -> PyResult<Py<ProcResult>> {
-    let py = params.py();
-
-    let input: Option<Bound<'_, PyDict>> = if params.is_none() {
-        None
-    } else {
-        let dict = params.downcast::<PyDict>().map_err(|_| {
-            to_py_err(CoreError::Parameter(
-                "call_proc: params debe ser un dict {nombre: valor} (o None)".to_string(),
-            ))
-        })?;
-        Some(dict.clone())
-    };
-
-    let lease = futures::executor::block_on(engine.acquire()).map_err(to_py_err)?;
-
-    // 1. Metadata del procedimiento (nombres + tipo IN/OUT + SQL type).
-    let metadata = lease.proc_columns(schema, proc_name).map_err(to_py_err)?;
-    if metadata.is_empty() {
-        return Err(to_py_err(CoreError::Parameter(format!(
-            "call_proc: no se encontro el procedimiento {schema}.{proc_name} en el catalogo \
-             (o no tiene parametros)"
-        ))));
-    }
-
-    // 2. Resolver valores de entrada por nombre, en orden ordinal. Los OUT no
-    //    necesitan venir en el dict -- quedan como entrada None y aun asi se
-    //    bindean (el driver escribe el resultado).
+/// Resuelve los valores de entrada por NOMBRE en orden ordinal (dict ya
+/// validado). Los OUT que no vengan quedan como `None` -- igual se bindean
+/// (el driver escribe el resultado). Puro con GIL (convierte valores Python).
+pub(crate) fn resolve_named_values(
+    py: Python<'_>,
+    input: Option<&Bound<'_, PyDict>>,
+    metadata: &[ProcParam],
+) -> PyResult<Vec<Option<ParamValue>>> {
     let mut values: Vec<Option<ParamValue>> = Vec::with_capacity(metadata.len());
-    for p in &metadata {
-        let mut value = lookup_param(py, input.as_ref(), &p.name)?;
+    for p in metadata {
+        let mut value = lookup_param(py, input, &p.name)?;
         if value.is_none() && p.name.starts_with('@') {
-            value = lookup_param(py, input.as_ref(), &p.name[1..])?;
+            value = lookup_param(py, input, &p.name[1..])?;
         }
         values.push(value);
     }
+    Ok(values)
+}
 
-    // 3. Ejecutar: result sets + OUT/INOUT leidos de los buffers.
-    let (result_sets, out_params) = lease
-        .call_proc(schema, proc_name, &metadata, &values)
-        .map_err(to_py_err)?;
+/// Extrae los items posicionales de `params` (`list`/`tuple`) o vacio si es
+/// `None`. Un `dict` u otra cosa se rechaza con `ParameterError`. Puro con
+/// GIL: los llamadores lo corren ANTES de adquirir la conexion, para que un
+/// `params` mal formado falle sin tocar la base (paridad con el orden de
+/// errores original de `call_proc_args`).
+pub(crate) fn positional_items<'py>(
+    params: &Bound<'py, PyAny>,
+) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    if params.is_none() {
+        return Ok(Vec::new());
+    }
+    if let Ok(list) = params.downcast::<PyList>() {
+        return Ok(list.iter().collect());
+    }
+    if let Ok(tuple) = params.downcast::<PyTuple>() {
+        return Ok(tuple.iter().collect());
+    }
+    Err(to_py_err(CoreError::Parameter(
+        "call_proc_args: params debe ser una secuencia posicional (list/tuple) u None; \
+         use call_proc con un dict si quiere pasar parametros por nombre"
+            .to_string(),
+    )))
+}
 
-    // 4. Result sets -> list[list[Row]].
-    let out_list = PyList::empty_bound(py);
-    for (columns, rows) in &result_sets {
-        let list = batch_to_pylist(py, columns, rows, strip_char_padding, decimal_mode)?;
-        out_list.append(list.into_py(py))?;
+/// Valida aridad + cada valor posicional (`items` de `positional_items`)
+/// contra la metadata del catalogo. Junta TODOS los fallos antes de fallar
+/// (no corta al primero). Puro con GIL.
+pub(crate) fn resolve_positional_items(
+    py: Python<'_>,
+    items: &[Bound<'_, PyAny>],
+    metadata: &[ProcParam],
+    schema: &str,
+    proc_name: &str,
+) -> PyResult<Vec<Option<ParamValue>>> {
+    if items.len() != metadata.len() {
+        return Err(to_py_err(CoreError::Parameter(format!(
+            "call_proc_args: {schema}.{proc_name} espera {} parametro(s) (en orden ordinal), \
+             se recibieron {}",
+            metadata.len(),
+            items.len()
+        ))));
     }
 
-    // 5. OUT/INOUT -> dict {nombre: valor}, convertidos por su SQL type.
+    let mut values: Vec<Option<ParamValue>> = Vec::with_capacity(metadata.len());
+    let mut failures: Vec<crate::core::ProcParamError> = Vec::new();
+    for (i, param) in metadata.iter().enumerate() {
+        let item = &items[i];
+        if item.is_none() {
+            values.push(None);
+            continue;
+        }
+        let pv = param_value_from_python(py, item)?;
+        if param.io_type == SQL_PARAM_OUTPUT {
+            // OUT puro: el valor de entrada se ignora (el driver escribe el
+            // resultado) -- no se valida.
+            values.push(None);
+        } else {
+            if let Err(e) = validate_proc_param(i, param, Some(&pv)) {
+                failures.push(e);
+            }
+            values.push(Some(pv));
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(proc_validation_error(schema, proc_name, &failures));
+    }
+    Ok(values)
+}
+
+/// `positional_items` + `resolve_positional_items` en un solo paso, para los
+/// llamadores que ya tienen la metadata y el GIL (streams, blocking).
+pub(crate) fn resolve_positional_values(
+    py: Python<'_>,
+    params: &Bound<'_, PyAny>,
+    metadata: &[ProcParam],
+    schema: &str,
+    proc_name: &str,
+) -> PyResult<Vec<Option<ParamValue>>> {
+    let items = positional_items(params)?;
+    resolve_positional_items(py, &items, metadata, schema, proc_name)
+}
+
+/// OUT/INOUT (`(indice, texto_o_NULL)`) -> `dict {nombre: valor}` convertido
+/// por SQL type. Puro con GIL.
+pub(crate) fn out_params_to_pydict(
+    py: Python<'_>,
+    metadata: &[ProcParam],
+    out_params: &ProcOutParams,
+    strip_char_padding: bool,
+    decimal_mode: &str,
+) -> PyResult<Py<PyDict>> {
     let out_dict = PyDict::new_bound(py);
-    for (idx, text) in &out_params {
+    for (idx, text) in out_params {
         let p = &metadata[*idx];
         let meta = ColumnMeta {
             name: p.name.clone(),
@@ -140,12 +210,120 @@ pub fn call_proc_sync(
         };
         out_dict.set_item(&p.name, value)?;
     }
+    Ok(out_dict.unbind())
+}
+
+/// Drena un `ProcCursor` set por set, lote por lote, convirtiendo cada lote
+/// a Python y liberando el buffer Rust antes del siguiente fetch. El fetch y
+/// el `advance` corren con el GIL liberado; la conversion con GIL.
+///
+/// Devuelve `(list[list[Row]], out_params_rust)`.
+pub(crate) fn drain_proc_cursor_to_pylists(
+    py: Python<'_>,
+    cursor: &mut ProcCursor,
+    strip_char_padding: bool,
+    decimal_mode: &str,
+) -> PyResult<(Py<PyList>, ProcOutParams)> {
+    let out_list = PyList::empty_bound(py);
+    loop {
+        if cursor.is_done() {
+            break;
+        }
+        let columns = cursor.current_columns().to_vec();
+        if columns.is_empty() {
+            let has_more = py.allow_threads(|| cursor.advance()).map_err(to_py_err)?;
+            if !has_more {
+                break;
+            }
+            continue;
+        }
+        let set_list = PyList::empty_bound(py);
+        loop {
+            let batch = py
+                .allow_threads(|| cursor.fetch_batch(PROC_FETCH_CHUNK))
+                .map_err(to_py_err)?;
+            if batch.is_empty() {
+                break;
+            }
+            let pylist = batch_to_pylist(py, &columns, &batch, strip_char_padding, decimal_mode)?;
+            for item in pylist.bind(py).iter() {
+                set_list.append(item)?;
+            }
+            // `batch` se dropea aca: pico Rust acotado a un lote.
+        }
+        out_list.append(set_list)?;
+        let has_more = py.allow_threads(|| cursor.advance()).map_err(to_py_err)?;
+        if !has_more {
+            break;
+        }
+    }
+    let out_params = cursor.take_out_params().unwrap_or_default();
+    Ok((out_list.unbind(), out_params))
+}
+
+/// Convierte los parametros posicionales de Python (dict por nombre) y llama
+/// al procedimiento con bindeo OUT/INOUT. `params` es un dict o `None`;
+/// acepta tambien el prefijo `@` en el nombre del dict (como el C++).
+pub fn call_proc_sync(
+    engine: &SharedEngine,
+    schema: &str,
+    proc_name: &str,
+    params: &Bound<'_, PyAny>,
+    strip_char_padding: bool,
+    decimal_mode: &str,
+) -> PyResult<Py<ProcResult>> {
+    let py = params.py();
+
+    // El dict se retiene como handle propio: el acquire + catalogo corren con
+    // el GIL liberado y el Bound original no puede usarse ahi dentro.
+    let input_owned: Option<Py<PyDict>> = if params.is_none() {
+        None
+    } else {
+        let dict = params.downcast::<PyDict>().map_err(|_| {
+            to_py_err(CoreError::Parameter(
+                "call_proc: params debe ser un dict {nombre: valor} (o None)".to_string(),
+            ))
+        })?;
+        Some(dict.clone().unbind())
+    };
+
+    // 1. Lease + metadata, con el GIL liberado (ODBC bloqueante).
+    let (lease, metadata) = py.allow_threads(|| {
+        let lease = futures::executor::block_on(engine.acquire()).map_err(to_py_err)?;
+        let metadata = lease.proc_columns(schema, proc_name).map_err(to_py_err)?;
+        Ok::<_, PyErr>((lease, metadata))
+    })?;
+    if metadata.is_empty() {
+        return Err(to_py_err(CoreError::Parameter(format!(
+            "call_proc: no se encontro el procedimiento {schema}.{proc_name} en el catalogo \
+             (o no tiene parametros)"
+        ))));
+    }
+
+    // 2. Resolver valores por nombre (con GIL).
+    let input_bound: Option<Bound<'_, PyDict>> = input_owned.as_ref().map(|d| d.bind(py).clone());
+    let values = resolve_named_values(py, input_bound.as_ref(), &metadata)?;
+
+    // 3. Cursor del CALL, con el GIL liberado (bind + exec bloqueantes).
+    let mut cursor = py.allow_threads(|| {
+        lease
+            .call_proc_cursor(schema, proc_name, &metadata, &values)
+            .map_err(to_py_err)
+    })?;
+
+    // 4. Drenar por lotes (fetch sin GIL, conversion con GIL).
+    let (out_list, out_params) =
+        drain_proc_cursor_to_pylists(py, &mut cursor, strip_char_padding, decimal_mode)?;
+
+    // 5. OUT/INOUT -> dict.
+    let out_dict =
+        out_params_to_pydict(py, &metadata, &out_params, strip_char_padding, decimal_mode)?;
 
     Py::new(
         py,
         ProcResult {
-            result_sets: out_list.unbind(),
-            out_params: out_dict.unbind(),
+            result_sets: out_list,
+            out_params: out_dict,
         },
     )
 }
@@ -153,7 +331,11 @@ pub fn call_proc_sync(
 /// Mensaje agregado de `ProcValidationError`: lista cada variable invalida con
 /// su posicion, nombre, tipo esperado y motivo. Pasa por `scrub_password` antes
 /// de llegar a Python (regla dura de AGENTS.md ss8).
-fn proc_validation_error(schema: &str, proc_name: &str, failures: &[ProcParamError]) -> PyErr {
+fn proc_validation_error(
+    schema: &str,
+    proc_name: &str,
+    failures: &[crate::core::ProcParamError],
+) -> PyErr {
     let parts: Vec<String> = failures
         .iter()
         .map(|f| {
@@ -202,10 +384,16 @@ pub fn call_proc_args_sync(
 ) -> PyResult<Py<ProcResult>> {
     let py = params.py();
 
-    let lease = futures::executor::block_on(engine.acquire()).map_err(to_py_err)?;
+    // La forma de `params` se valida ANTES de adquirir la conexion (paridad
+    // con el orden de errores original): un dict u otra cosa no es secuencia.
+    let items = positional_items(params)?;
 
-    // 1. Metadata del procedimiento (mismo orden ordinal que la tupla).
-    let metadata = lease.proc_columns(schema, proc_name).map_err(to_py_err)?;
+    // 1. Lease + metadata, con el GIL liberado.
+    let (lease, metadata) = py.allow_threads(|| {
+        let lease = futures::executor::block_on(engine.acquire()).map_err(to_py_err)?;
+        let metadata = lease.proc_columns(schema, proc_name).map_err(to_py_err)?;
+        Ok::<_, PyErr>((lease, metadata))
+    })?;
     if metadata.is_empty() {
         return Err(to_py_err(CoreError::Parameter(format!(
             "call_proc_args: no se encontro el procedimiento {schema}.{proc_name} en el catalogo \
@@ -213,100 +401,29 @@ pub fn call_proc_args_sync(
         ))));
     }
 
-    // 2. Colectar la secuencia posicional (list/tuple) o vacia si `params` es
-    //    None. Un dict (call_proc por nombre) o cualquier otra cosa se rechaza
-    //    con un mensaje claro.
-    let items: Vec<Bound<'_, PyAny>> = if params.is_none() {
-        Vec::new()
-    } else if let Ok(list) = params.downcast::<PyList>() {
-        list.iter().collect()
-    } else if let Ok(tuple) = params.downcast::<PyTuple>() {
-        tuple.iter().collect()
-    } else {
-        return Err(to_py_err(CoreError::Parameter(
-            "call_proc_args: params debe ser una secuencia posicional (list/tuple) u None; \
-             use call_proc con un dict si quiere pasar parametros por nombre"
-                .to_string(),
-        )));
-    };
+    // 2-3. Validar aridad + tipos (todos los fallos juntos).
+    let values = resolve_positional_items(py, &items, &metadata, schema, proc_name)?;
 
-    if items.len() != metadata.len() {
-        return Err(to_py_err(CoreError::Parameter(format!(
-            "call_proc_args: {schema}.{proc_name} espera {} parametro(s) (en orden ordinal), \
-             se recibieron {}",
-            metadata.len(),
-            items.len()
-        ))));
-    }
+    // 4. Cursor del CALL, con el GIL liberado.
+    let mut cursor = py.allow_threads(|| {
+        lease
+            .call_proc_cursor(schema, proc_name, &metadata, &values)
+            .map_err(to_py_err)
+    })?;
 
-    // 3. Resolver valores por posicion y validar cada IN/INOUT. Se juntan TODOS
-    //    los fallos antes de fallar (no corta al primero).
-    let mut values: Vec<Option<ParamValue>> = Vec::with_capacity(metadata.len());
-    let mut failures: Vec<ProcParamError> = Vec::new();
-    for (i, param) in metadata.iter().enumerate() {
-        let item = &items[i];
-        if item.is_none() {
-            values.push(None);
-            continue;
-        }
-        let pv = param_value_from_python(py, item)?;
-        if param.io_type == SQL_PARAM_OUTPUT {
-            // OUT puro: el valor de entrada se ignora (el driver escribe el
-            // resultado) -- no se valida.
-            values.push(None);
-        } else {
-            if let Err(e) = validate_proc_param(i, param, Some(&pv)) {
-                failures.push(e);
-            }
-            values.push(Some(pv));
-        }
-    }
+    // 5. Drenar por lotes.
+    let (out_list, out_params) =
+        drain_proc_cursor_to_pylists(py, &mut cursor, strip_char_padding, decimal_mode)?;
 
-    if !failures.is_empty() {
-        return Err(proc_validation_error(schema, proc_name, &failures));
-    }
-
-    // 4. Ejecutar: result sets + OUT/INOUT leidos de los buffers.
-    let (result_sets, out_params) = lease
-        .call_proc(schema, proc_name, &metadata, &values)
-        .map_err(to_py_err)?;
-
-    // 5. Result sets -> list[list[Row]].
-    let out_list = PyList::empty_bound(py);
-    for (columns, rows) in &result_sets {
-        let list = batch_to_pylist(py, columns, rows, strip_char_padding, decimal_mode)?;
-        out_list.append(list.into_py(py))?;
-    }
-
-    // 6. OUT/INOUT -> dict {nombre: valor}, convertidos por su SQL type.
-    let out_dict = PyDict::new_bound(py);
-    for (idx, text) in &out_params {
-        let p = &metadata[*idx];
-        let meta = ColumnMeta {
-            name: p.name.clone(),
-            sql_type: p.sql_type,
-            column_size: p.column_size,
-            decimal_digits: p.decimal_digits,
-            nullable: true,
-        };
-        let value = match text {
-            Some(s) => column_value_to_py(
-                py,
-                &meta,
-                &ColumnValue::Text(s.clone()),
-                strip_char_padding,
-                decimal_mode,
-            )?,
-            None => py.None(),
-        };
-        out_dict.set_item(&p.name, value)?;
-    }
+    // 6. OUT/INOUT -> dict.
+    let out_dict =
+        out_params_to_pydict(py, &metadata, &out_params, strip_char_padding, decimal_mode)?;
 
     Py::new(
         py,
         ProcResult {
-            result_sets: out_list.unbind(),
-            out_params: out_dict.unbind(),
+            result_sets: out_list,
+            out_params: out_dict,
         },
     )
 }

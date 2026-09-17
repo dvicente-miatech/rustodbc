@@ -364,6 +364,31 @@ el cast** al tipo declarado (un `1` int para un `varchar(1)` llega como `"1"`; u
 antes de la llamada, para dar errores claros en vez del truncamiento silencioso
 que cortaría, por ejemplo, `"ABC"` en un `VARCHAR(1)` a `"A"`.
 
+#### Streaming de procedimientos (`call_proc_stream` / `call_proc_args_stream`)
+
+`call_proc`/`call_proc_args` devuelven todo en memoria (`ProcResult`). Si el
+procedimiento devuelve result sets grandes, el streaming itera
+`(set_index, list[Row])` **por lotes sin materializar todo** (RAM acotada,
+no crece con el tamaño). Vale para `call_proc_stream` (dict por nombre) y
+`call_proc_args_stream` (secuencia posicional, con la misma validación
+`ProcValidationError` eager — el error sale en el call, no a mitad de la
+iteración):
+
+```python
+stream = await engine.call_proc_args_stream("SCHEMA", "BIG_PROC", ["A", None], batch_size=5000)
+async for set_index, batch in stream:
+    for row in batch:      # procesar y descartar: no acumular
+        ...
+out = stream.out_params    # OUT/INOUT, solo tras agotar el stream
+```
+
+Reglas: los lotes del mismo set son contiguos (`set_index` los delimita; los
+sets vacíos no producen lotes); `out_params` levanta `InterfaceError` si el
+stream no se agotó (nunca parcial); `cancel()`/`aclose()` cortan con
+`SQLCancel` real. Si el consumidor acumula los lotes en una lista, la memoria
+es la misma que con `ProcResult` — el streaming solo ahorra si cada lote se
+procesa y se suelta (p. ej. escribirlo a un `StreamingResponse`).
+
 ### MERGE/upsert (`TableSync`)
 
 Por composición, nunca herencia:
@@ -451,6 +476,16 @@ engine.close()
 for batch in engine.stream("SELECT * FROM SCHEMA.HUGE_TABLE", batch_size=5000):
     for row in batch:
         ...
+```
+
+**Streaming síncrono de procedimientos** (RAM acotada; `out_params` tras agotar):
+
+```python
+stream = engine.call_proc_args_stream("SCHEMA", "BIG_PROC", ["A", None])
+for set_index, batch in stream:
+    for row in batch:
+        ...
+out = stream.out_params
 ```
 
 **MERGE síncrono:**

@@ -7,6 +7,18 @@
 //! atiende un canal de cancelacion: `cancel()` dispara un `SQLCancel` real
 //! sobre el statement y corta el drenado.
 //!
+//! **Fin del stream: manda el canal, nunca un flag.** El productor manda el
+//! centinela `Ok(vec![])` como ultimo item y despues suelta `tx`. El
+//! consumidor termina cuando recibe el centinela o cuando `recv()` devuelve
+//! `None` (canal cerrado). Como el canal es FIFO y el centinela va DESPUES de
+//! todos los lotes reales, nada encolado se pierde. Un flag compartido con
+//! "ya termine" NO sirve: el productor puede setearlo mientras todavia hay
+//! lotes en el canal, y el `__anext__` que lo honra pierde el ultimo lote.
+//!
+//! `cancelled` es **solo del consumidor** (`cancel()`/`aclose()`): el
+//! productor jamas lo toca. Sirve para que `__anext__` corte ya aunque la
+//! tarea este trabada en un ODBC que `SQLCancel` todavia no desbloqueo.
+//!
 //! `__anext__` recibe del canal: mientras Python consume el lote actual, la
 //! tarea ya pidio el siguiente al driver. El `Lease` no vuelve al pool hasta
 //! que la tarea termina (agotado, cancelado o canal cerrado), asi el `HStmt`
@@ -47,11 +59,14 @@ pub struct BatchStream {
     /// cerrar para que el Lease vuelva al pool.
     task: Arc<tokio::task::JoinHandle<()>>,
     options: EngineOptions,
-    /// Metadata de columnas (necesaria para convertir lotes a `list[dict]`;
-    /// la tarea tiene el cursor, este pyclass conserva la metadata).
+    /// Metadata de columnas (necesaria para convertir lotes a `list[dict]`; la
+    /// tarea tiene el cursor, este pyclass conserva la metadata).
     columns_meta: Vec<ColumnMeta>,
     columns: Vec<String>,
-    exhausted: Arc<AtomicBool>,
+    /// Solo lo setean `cancel()`/`aclose()` (decision del consumidor). El
+    /// productor NUNCA lo toca -- ver la nota de fin de stream en el doc del
+    /// modulo.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl BatchStream {
@@ -67,20 +82,35 @@ impl BatchStream {
         let capacity = prefetch_batches.max(1);
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let exhausted = Arc::new(AtomicBool::new(false));
-        let exhausted_2 = exhausted.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
 
         // La tarea drena el cursor en spawn_blocking (el SQLFetch es
-        // bloqueante) y entre lotes atiende la cancelacion: al recibir la
+        // bloqueante) y atiende la cancelacion en cada paso: al recibir la
         // senal, hace `SQLCancel` REAL sobre el statement (el cursor vive en
-        // un `Arc<Mutex>` compartido entre la tarea y la senal) y CONSUME la
-        // conexion permanentemente (`take_connection`) -- el SQLDisconnect
-        // corta cualquier resto y la conexion nunca vuelve al pool (regla
-        // AGENTS.md ss4). Cuando el receiver se dropea (stream cerrado),
-        // `send` falla y la tarea sale igual.
+        // un `Arc<Mutex>` compartido) y CONSUME la conexion permanentemente
+        // (`take_connection`) -- el SQLDisconnect corta cualquier resto y la
+        // conexion nunca vuelve al pool (regla AGENTS.md ss4). Cuando el
+        // receiver se dropea (stream cerrado), `send` falla y la tarea sale
+        // igual.
         let task = tokio::task::spawn(async move {
             let mut lease = Some(lease);
             let cursor = Arc::new(std::sync::Mutex::new(cursor));
+
+            // Cancelacion pedida por el consumidor: SQLCancel REAL + consumir
+            // la conexion + terminar la tarea.
+            macro_rules! cancel_and_discard {
+                () => {{
+                    if let Ok(guard) = cursor.lock() {
+                        let _ = guard.cancel();
+                    }
+                    drop(cursor);
+                    if let Some(l) = lease.take() {
+                        drop(l.take_connection());
+                    }
+                    return;
+                }};
+            }
+
             loop {
                 let cursor_for_fetch = cursor.clone();
                 let fetched = tokio::select! {
@@ -97,26 +127,22 @@ impl BatchStream {
                             ))),
                         }
                     }
-                    _ = cancel_rx.recv() => {
-                        // Cancelacion pedida por el consumidor: SQLCancel REAL
-                        // sobre el statement + CONSUMIR la conexion.
-                        if let Ok(guard) = cursor.lock() {
-                            let _ = guard.cancel();
-                        }
-                        drop(cursor);
-                        if let Some(l) = lease.take() {
-                            drop(l.take_connection());
-                        }
-                        return;
-                    }
+                    _ = cancel_rx.recv() => { cancel_and_discard!(); }
                 };
 
                 let is_exhausted = matches!(&fetched, Ok(b) if b.is_empty());
-                if tx.send(fetched).await.is_err() {
-                    return; // lease/cursor se dropean al salir
+                // El ENVIO tambien es cancelable: si el consumidor esta
+                // parado (canal lleno) y pide cancelar, hay que ejecutar el
+                // SQLCancel igual. Sin esto la tarea queda parkeada en `send`
+                // y la rama de cancelacion nunca corre.
+                let sent = tokio::select! {
+                    r = tx.send(fetched) => r.is_ok(),
+                    _ = cancel_rx.recv() => { cancel_and_discard!(); }
+                };
+                if !sent {
+                    return; // consumidor cerrado: lease/cursor se dropean al salir
                 }
                 if is_exhausted {
-                    exhausted_2.store(true, Ordering::SeqCst);
                     drop(cursor);
                     if let Some(l) = lease.take() {
                         drop(l); // vuelve al pool sano
@@ -133,7 +159,7 @@ impl BatchStream {
             options,
             columns_meta,
             columns,
-            exhausted,
+            cancelled,
         }
     }
 }
@@ -151,24 +177,23 @@ impl BatchStream {
 
     fn __anext__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rx = self.rx.clone();
-        let exhausted = self.exhausted.clone();
+        let cancelled = self.cancelled.clone();
         let options = self.options.clone();
         let columns_meta = self.columns_meta.clone();
 
-        // Timeout opcional esperando el lote (query_timeout segundos; 0 =
-        // sin timeout). Si el driver esta trabado en un fetch en curso, el
-        // timeout devuelve error al consumidor; aclose()/cancel() cortan la
-        // tarea.
+        // Timeout opcional esperando el lote (query_timeout segundos; 0 = sin
+        // timeout). Si el driver esta trabado en un fetch en curso, el timeout
+        // devuelve error al consumidor; aclose()/cancel() cortan la tarea.
         let wait_secs = options.query_timeout;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if exhausted.load(Ordering::SeqCst) {
+            if cancelled.load(Ordering::SeqCst) {
                 return Err(PyStopAsyncIteration::new_err(()));
             }
 
             // Tomar el receiver del mutex compartido. Se reinserta al final
-            // (o se dropea en los caminos de error/agotado, lo que hace que
-            // la tarea de prefetch vea `send` fallar y suelte el Lease).
+            // (o se dropea en los caminos de fin, lo que hace que la tarea de
+            // prefetch vea `send` fallar y suelte el Lease).
             let receiver = {
                 let mut guard = rx.lock().await;
                 guard.take()
@@ -201,15 +226,15 @@ impl BatchStream {
             let batch = match batch {
                 Some(b) => b,
                 None => {
-                    // Canal cerrado (tarea abortada o stream cerrado).
-                    exhausted.store(true, Ordering::SeqCst);
+                    // Canal cerrado: la tarea termino y ya entrego TODO lo
+                    // encolado (o se aborto). Fin normal.
                     return Err(PyStopAsyncIteration::new_err(()));
                 }
             };
 
             let is_empty = matches!(&batch, Ok(b) if b.is_empty());
             if is_empty {
-                exhausted.store(true, Ordering::SeqCst);
+                // Centinela del productor: todo lo anterior ya se entrego.
                 return Err(PyStopAsyncIteration::new_err(()));
             }
 
@@ -233,23 +258,20 @@ impl BatchStream {
     /// sobre el statement y CONSUMIR la conexion (nunca vuelve al pool).
     /// Seguro de llamar mientras un `__anext__` esta en curso; el proximo
     /// `__anext__` sale con StopAsyncIteration.
+    ///
+    /// NO se dropea el receiver aca: si se dropeara, el `send` pendiente de la
+    /// tarea fallaria y la tarea saldria por ese camino SIN ejecutar el
+    /// `SQLCancel`. La senal (`cancel_tx`) es la unica via.
     fn cancel(&self) -> PyResult<()> {
-        self.exhausted.store(true, Ordering::SeqCst);
-        // La tarea atiende la senal entre lotes (o al terminar el fetch en
-        // curso): hace SQLCancel y consume la conexion. NO se aborta la
-        // tarea aca -- el abort impediria que ejecute el SQLCancel.
+        self.cancelled.store(true, Ordering::SeqCst);
         let _ = self.cancel_tx.try_send(());
-        if let Ok(mut guard) = self.rx.try_lock() {
-            *guard = None; // el proximo __anext__ sale por canal cerrado
-        }
         Ok(())
     }
 
+    /// Corta el stream ya: aborta la tarea (no busca un `SQLCancel` ordenado
+    /// -- para eso esta `cancel()`) y cierra el canal si no esta en uso.
     fn aclose<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.exhausted.store(true, Ordering::SeqCst);
-        // Cerrar el canal: dropear el receiver (si no esta en uso por un
-        // `__anext__` en curso). La tarea de prefetch ve `send` fallar y
-        // suelta el Lease.
+        self.cancelled.store(true, Ordering::SeqCst);
         if let Ok(mut guard) = self.rx.try_lock() {
             *guard = None;
         }

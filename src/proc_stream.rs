@@ -3,8 +3,8 @@
 //! Misma arquitectura que `BatchStream` (`stream.rs`): al crear el stream se
 //! spawna una tarea tokio que es DUENA del `(Lease, ProcCursor)` y va
 //! drenando set por set, mandando eventos por un canal `mpsc` de capacidad
-//! `prefetch_batches`. El fetch bloqueante corre en `spawn_blocking`; entre
-//! operaciones la tarea atiende un canal de cancelacion con `SQLCancel` real.
+//! `prefetch_batches`. El fetch bloqueante corre en `spawn_blocking`; en cada
+//! paso la tarea atiende un canal de cancelacion con `SQLCancel` real.
 //!
 //! Protocolo del canal (`ProcEvent`):
 //! - `ResultSet{index, columns, names}`: arranca un set (solo sets con
@@ -13,11 +13,21 @@
 //! - `Done(out_params)`: se agotaron todos los sets; los OUT/INOUT ya leidos
 //!   viajan aca (solo validos tras drenar todo, por spec ODBC).
 //!
+//! **Fin del stream: manda el canal, nunca un flag.** El productor manda
+//! `Done` como ultimo evento y despues suelta `tx`; el consumidor termina con
+//! el `Done` o con `recv() -> None`. Un flag compartido "ya termine" NO sirve:
+//! el productor puede setearlo mientras el `Done` (y los ultimos lotes) sigue
+//! encolado, y el `__anext__` que lo honra sale sin leerlo -- se pierden los
+//! OUT y los ultimos lotes (repro: proc rapido, SQP06208).
+//!
+//! `cancelled` es **solo del consumidor** (`cancel()`/`aclose()`): el
+//! productor jamas lo toca.
+//!
 //! `__anext__` devuelve `(set_index, list[Row])` plano: los lotes del mismo
 //! set son contiguos, asi que el consumidor que quiera agrupar por set lo
-//! hace con `itertools.groupby` sin que Rust pague una capa anidada. Los
-//! sets con columnas pero 0 filas no producen lotes (se saltan; no hay filas
-//! que entregar).
+//! hace con `itertools.groupby` sin que Rust pague una capa anidada. Los sets
+//! con columnas pero 0 filas no producen lotes (se saltan; no hay filas que
+//! entregar).
 //!
 //! RAM acotada a `prefetch_batches` eventos en vuelo + el lote en consumo.
 //! `out_params` es ESTRICTO: si el stream no se agoto, levanta
@@ -81,7 +91,10 @@ pub struct ProcStream {
     /// Metadata del catalogo (para convertir OUT por SQL type en el getter).
     metadata: Vec<ProcParam>,
     state: Arc<std::sync::Mutex<ProcStreamState>>,
-    exhausted: Arc<AtomicBool>,
+    /// Solo lo setean `cancel()`/`aclose()` (decision del consumidor). El
+    /// productor NUNCA lo toca -- ver la nota de fin de stream en el doc del
+    /// modulo.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl ProcStream {
@@ -107,12 +120,39 @@ impl ProcStream {
         let capacity = prefetch_batches.max(1);
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let exhausted = Arc::new(AtomicBool::new(false));
-        let exhausted_2 = exhausted.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
 
         let task = tokio::task::spawn(async move {
             let mut lease = Some(lease);
             let cursor = Arc::new(std::sync::Mutex::new(cursor));
+
+            // Cancelacion pedida por el consumidor: SQLCancel REAL + consumir
+            // la conexion + terminar la tarea.
+            macro_rules! cancel_and_discard {
+                () => {{
+                    if let Ok(guard) = cursor.lock() {
+                        let _ = guard.cancel();
+                    }
+                    drop(cursor);
+                    if let Some(l) = lease.take() {
+                        drop(l.take_connection());
+                    }
+                    return;
+                }};
+            }
+
+            // Envio cancelable: si el consumidor esta parado (canal lleno) y
+            // pide cancelar, hay que ejecutar el SQLCancel igual. Sin esto la
+            // tarea queda parkeada en `send` y la rama de cancelacion nunca
+            // corre.
+            macro_rules! send_or_cancel {
+                ($item:expr) => {
+                    tokio::select! {
+                        r = tx.send($item) => r.is_ok(),
+                        _ = cancel_rx.recv() => { cancel_and_discard!(); }
+                    }
+                };
+            }
 
             // Evento inicial: primer set o Done directo (proc sin sets).
             {
@@ -129,23 +169,18 @@ impl ProcStream {
                     }
                 };
                 if is_done {
-                    let _ = tx.send(Ok(ProcEvent::Done(out))).await;
-                    exhausted_2.store(true, Ordering::SeqCst);
+                    let _ = send_or_cancel!(Ok(ProcEvent::Done(out)));
                     drop(cursor);
                     if let Some(l) = lease.take() {
                         drop(l);
                     }
                     return;
                 }
-                if tx
-                    .send(Ok(ProcEvent::ResultSet {
-                        index: idx,
-                        columns: cols,
-                        names,
-                    }))
-                    .await
-                    .is_err()
-                {
+                if !send_or_cancel!(Ok(ProcEvent::ResultSet {
+                    index: idx,
+                    columns: cols,
+                    names,
+                })) {
                     return;
                 }
             }
@@ -163,30 +198,21 @@ impl ProcStream {
                             Err(e) => Err(CoreError::Connect(format!("panic: {e}"))),
                         }
                     }
-                    _ = cancel_rx.recv() => {
-                        if let Ok(guard) = cursor.lock() {
-                            let _ = guard.cancel();
-                        }
-                        drop(cursor);
-                        if let Some(l) = lease.take() {
-                            drop(l.take_connection());
-                        }
-                        return;
-                    }
+                    _ = cancel_rx.recv() => { cancel_and_discard!(); }
                 };
 
                 match fetched {
                     Err(e) => {
                         // Como `BatchStream`: se entrega el error pero el
                         // stream sigue usable.
-                        if tx.send(Err(e)).await.is_err() {
+                        if !send_or_cancel!(Err(e)) {
                             return;
                         }
                         continue;
                     }
                     Ok(batch) => {
                         if !batch.is_empty() {
-                            if tx.send(Ok(ProcEvent::Batch(batch))).await.is_err() {
+                            if !send_or_cancel!(Ok(ProcEvent::Batch(batch))) {
                                 return;
                             }
                             continue;
@@ -215,23 +241,13 @@ impl ProcStream {
                                     Err(e) => Err(CoreError::Connect(format!("panic: {e}"))),
                                 }
                             }
-                            _ = cancel_rx.recv() => {
-                                if let Ok(guard) = cursor.lock() {
-                                    let _ = guard.cancel();
-                                }
-                                drop(cursor);
-                                if let Some(l) = lease.take() {
-                                    drop(l.take_connection());
-                                }
-                                return;
-                            }
+                            _ = cancel_rx.recv() => { cancel_and_discard!(); }
                         };
                         match advanced {
                             Err(e) => {
                                 // Error de posicion: terminar (posicion
                                 // desconocida, no seguir).
-                                let _ = tx.send(Err(e)).await;
-                                exhausted_2.store(true, Ordering::SeqCst);
+                                let _ = send_or_cancel!(Err(e));
                                 drop(cursor);
                                 if let Some(l) = lease.take() {
                                     drop(l);
@@ -243,21 +259,16 @@ impl ProcStream {
                                 columns,
                                 names,
                             }) => {
-                                if tx
-                                    .send(Ok(ProcEvent::ResultSet {
-                                        index,
-                                        columns,
-                                        names,
-                                    }))
-                                    .await
-                                    .is_err()
-                                {
+                                if !send_or_cancel!(Ok(ProcEvent::ResultSet {
+                                    index,
+                                    columns,
+                                    names,
+                                })) {
                                     return;
                                 }
                             }
                             Ok(AdvOutcome::Finished(out)) => {
-                                let _ = tx.send(Ok(ProcEvent::Done(out))).await;
-                                exhausted_2.store(true, Ordering::SeqCst);
+                                let _ = send_or_cancel!(Ok(ProcEvent::Done(out)));
                                 drop(cursor);
                                 if let Some(l) = lease.take() {
                                     drop(l);
@@ -277,7 +288,7 @@ impl ProcStream {
             options,
             metadata,
             state,
-            exhausted,
+            cancelled,
         }
     }
 }
@@ -330,13 +341,13 @@ impl ProcStream {
 
     fn __anext__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rx = self.rx.clone();
-        let exhausted = self.exhausted.clone();
+        let cancelled = self.cancelled.clone();
         let options = self.options.clone();
         let state = self.state.clone();
         let wait_secs = options.query_timeout;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if exhausted.load(Ordering::SeqCst) {
+            if cancelled.load(Ordering::SeqCst) {
                 return Err(PyStopAsyncIteration::new_err(()));
             }
 
@@ -373,7 +384,8 @@ impl ProcStream {
                 let event = match event {
                     Some(b) => b,
                     None => {
-                        exhausted.store(true, Ordering::SeqCst);
+                        // Canal cerrado: la tarea termino y ya entrego TODO lo
+                        // encolado (o se aborto). Fin normal.
                         return Err(PyStopAsyncIteration::new_err(()));
                     }
                 };
@@ -426,8 +438,9 @@ impl ProcStream {
                             guard.out_params = Some(out);
                             guard.done = true;
                         }
-                        exhausted.store(true, Ordering::SeqCst);
-                        // No reinsertar: la tarea termino y el canal se cierra.
+                        // No reinsertar: la tarea termino y el canal se
+                        // cierra; el proximo __anext__ sale por receiver
+                        // ausente. Los OUT ya quedaron en `state`.
                         return Err(PyStopAsyncIteration::new_err(()));
                     }
                 }
@@ -435,19 +448,22 @@ impl ProcStream {
         })
     }
 
-    /// Cancela el stream: pide a la tarea de prefetch un `SQLCancel` REAL
-    /// sobre el statement y CONSUME la conexion (nunca vuelve al pool).
+    /// Cancela el stream: pide a la tarea un `SQLCancel` REAL sobre el
+    /// statement y CONSUMIR la conexion (nunca vuelve al pool).
+    ///
+    /// NO se dropea el receiver aca: si se dropeara, el `send` pendiente de la
+    /// tarea fallaria y la tarea saldria por ese camino SIN ejecutar el
+    /// `SQLCancel`. La senal (`cancel_tx`) es la unica via.
     fn cancel(&self) -> PyResult<()> {
-        self.exhausted.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::SeqCst);
         let _ = self.cancel_tx.try_send(());
-        if let Ok(mut guard) = self.rx.try_lock() {
-            *guard = None;
-        }
         Ok(())
     }
 
+    /// Corta el stream ya: aborta la tarea (no busca un `SQLCancel` ordenado
+    /// -- para eso esta `cancel()`) y cierra el canal si no esta en uso.
     fn aclose<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.exhausted.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::SeqCst);
         if let Ok(mut guard) = self.rx.try_lock() {
             *guard = None;
         }

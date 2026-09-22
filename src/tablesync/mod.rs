@@ -53,6 +53,9 @@ pub struct TableSync {
     /// `source` (entonces `transfer` no esta disponible).
     source: Option<SharedEngine>,
     merge_chunk_size: usize,
+    /// Default de `max_workers` para `merge()`/`merge_sync()` cuando el caller
+    /// no lo pasa (`EngineOptions.merge_max_workers`).
+    merge_max_workers: usize,
     /// Runtime tokio para `merge_sync`/`transfer_sync` (solo presente en la
     /// fachada `BlockingEngine`). La fachada async usa `merge()` (awaitable).
     runtime: Option<tokio::runtime::Handle>,
@@ -63,12 +66,14 @@ impl TableSync {
         dest: SharedEngine,
         source: Option<SharedEngine>,
         merge_chunk_size: usize,
+        merge_max_workers: usize,
         runtime: Option<tokio::runtime::Handle>,
     ) -> Self {
         TableSync {
             dest,
             source,
             merge_chunk_size,
+            merge_max_workers: merge_max_workers.max(1),
             runtime,
         }
     }
@@ -120,7 +125,7 @@ fn records_to_columns_and_rows(
 
 #[pymethods]
 impl TableSync {
-    #[pyo3(signature = (schema, table, records, primary_key=None))]
+    #[pyo3(signature = (schema, table, records, primary_key=None, *, max_workers=None))]
     fn merge<'py>(
         &self,
         py: Python<'py>,
@@ -128,35 +133,32 @@ impl TableSync {
         table: String,
         records: Bound<'py, PyAny>,
         primary_key: Option<Vec<String>>,
+        max_workers: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (columns, rows) = records_to_columns_and_rows(py, &records)?;
         let dest = self.dest.clone();
         let chunk_size = self.merge_chunk_size;
-        let limits = dest.limits.clone();
+        let workers = max_workers.unwrap_or(self.merge_max_workers);
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let lease = dest.acquire().await.map_err(to_py_err)?;
-            tokio::task::spawn_blocking(move || {
-                merge_report_sync(
-                    &lease,
-                    &limits,
-                    &schema,
-                    &table,
-                    &columns,
-                    &rows,
-                    chunk_size,
-                    primary_key,
-                )
-            })
-            .await
-            .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
-        })
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            merge_report_async(
+                dest,
+                schema,
+                table,
+                columns,
+                rows,
+                chunk_size,
+                workers,
+                primary_key,
+            ),
+        )
     }
 
     /// Variante sincrona del MERGE (fachada `BlockingEngine`). Requiere que
     /// el `TableSync` se haya creado con un runtime tokio (via
     /// `BlockingEngine.table_sync()`); si no, `InterfaceError`.
-    #[pyo3(signature = (schema, table, records, primary_key=None))]
+    #[pyo3(signature = (schema, table, records, primary_key=None, *, max_workers=None))]
     fn merge_sync(
         &self,
         py: Python<'_>,
@@ -164,6 +166,7 @@ impl TableSync {
         table: String,
         records: Bound<'_, PyAny>,
         primary_key: Option<Vec<String>>,
+        max_workers: Option<usize>,
     ) -> PyResult<MergeReport> {
         let (columns, rows) = records_to_columns_and_rows(py, &records)?;
         let runtime = self.runtime.clone().ok_or_else(|| {
@@ -173,22 +176,19 @@ impl TableSync {
         })?;
         let dest = self.dest.clone();
         let chunk_size = self.merge_chunk_size;
-        let limits = dest.limits.clone();
+        let workers = max_workers.unwrap_or(self.merge_max_workers);
 
         py.allow_threads(move || {
-            let lease = runtime
-                .block_on(async move { dest.acquire().await })
-                .map_err(to_py_err)?;
-            merge_report_sync(
-                &lease,
-                &limits,
-                &schema,
-                &table,
-                &columns,
-                &rows,
+            runtime.block_on(merge_report_async(
+                dest,
+                schema,
+                table,
+                columns,
+                rows,
                 chunk_size,
+                workers,
                 primary_key,
-            )
+            ))
         })
     }
 
@@ -299,16 +299,18 @@ impl TableSync {
 }
 
 /// Cuerpo compartido del MERGE (async y sync): resuelve PK, degrada a INSERT
-/// sin PK, y ejecuta los chunks (con halve-and-retry de chunk size).
+/// sin PK, y ejecuta las piezas en `workers` conexiones (con halve-and-retry
+/// de tamano compartido). Devuelve `PyResult` para reusar el mapeo de errores
+/// de la capa PyO3 en los dos frontends.
 #[allow(clippy::too_many_arguments)]
-fn merge_report_sync(
-    lease: &crate::core::Lease,
-    limits: &std::sync::Mutex<crate::core::StatementLimits>,
-    schema: &str,
-    table: &str,
-    columns: &[String],
-    rows: &[Vec<ParamValue>],
+async fn merge_report_async(
+    dest: SharedEngine,
+    schema: String,
+    table: String,
+    columns: Vec<String>,
+    rows: Vec<Vec<ParamValue>>,
     chunk_size: usize,
+    workers: usize,
     primary_key: Option<Vec<String>>,
 ) -> PyResult<MergeReport> {
     if rows.is_empty() || columns.is_empty() {
@@ -322,43 +324,67 @@ fn merge_report_sync(
 
     let pk_columns = match primary_key {
         Some(pk) => pk,
-        None => catalog::primary_key_columns(lease, schema, table).map_err(to_py_err)?,
+        None => {
+            let lease = dest.acquire().await.map_err(to_py_err)?;
+            let schema2 = schema.clone();
+            let table2 = table.clone();
+            tokio::task::spawn_blocking(move || {
+                catalog::primary_key_columns(&lease, &schema2, &table2)
+            })
+            .await
+            .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
+            .map_err(to_py_err)?
+        }
     };
 
-    if pk_columns.is_empty() {
+    let (build, used_merge, warning): (
+        std::sync::Arc<dyn Fn(usize) -> String + Send + Sync>,
+        bool,
+        Option<String>,
+    ) = if pk_columns.is_empty() {
         // Regla dura AGENTS.md ss4: sin PK, INSERT con warning,
         // nunca crash y nunca MERGE silencioso sin clave.
-        let (rows_affected, batches) =
-            merge::insert_only_rows(lease, limits, schema, table, columns, rows, chunk_size)
-                .map_err(to_py_err)?;
-        return Ok(MergeReport {
-            rows_affected,
-            batches,
-            used_merge: false,
-            warning: Some(format!(
+        (
+            std::sync::Arc::new(merge::insert_sql_builder(
+                schema.clone(),
+                table.clone(),
+                columns.clone(),
+            )),
+            false,
+            Some(format!(
                 "{schema}.{table} no tiene PK/indice unico en el catalogo -- se hizo INSERT \
                  simple, no MERGE"
             )),
-        });
-    }
+        )
+    } else {
+        (
+            std::sync::Arc::new(merge::merge_sql_builder(
+                schema.clone(),
+                table.clone(),
+                pk_columns,
+                columns.clone(),
+            )),
+            true,
+            None,
+        )
+    };
 
-    let (rows_affected, batches) = merge::merge_rows(
-        lease,
-        limits,
-        schema,
-        table,
-        &pk_columns,
-        columns,
-        rows,
+    let report = crate::bulk::execute_workers_async(
+        &dest,
+        build,
+        std::sync::Arc::new(rows),
+        workers,
         chunk_size,
+        true,
     )
+    .await
     .map_err(to_py_err)?;
 
     Ok(MergeReport {
-        rows_affected,
-        batches,
-        used_merge: true,
-        warning: None,
+        rows_affected: report.rows_affected,
+        batches: report.batches,
+        used_merge,
+        warning,
     })
 }
 

@@ -106,6 +106,24 @@ pub fn is_reducible_size(native_code: i32) -> bool {
     matches!(native_code.abs(), 101 | 54001) // SQL0101 | SQL54001
 }
 
+/// `true` si el error es una senal de "el statement generado es demasiado
+/// grande" que el halve-and-retry puede resolver achicando el lote.
+///
+/// Ademas de los SQLCODE de DB2 for i (SQL0101/SQL54001, ver
+/// `is_reducible_size`), cubre el **HY090** que devuelve el Driver Manager o
+/// el driver (Microsoft ODBC DM / unixODBC, y tambien el propio IBM i Access
+/// ODBC) *antes* de que DB2 opine: `SQLExecDirectW` reporta HY090 con
+/// `cbSqlStr` invalido, y un statement multi-fila enorme puede dispararlo sin
+/// dejar ningun diagnostico de DB2 (`native_code == 0`). Sin esto, el error
+/// tiene SQLSTATE HY090 + code 0 y el halving nunca se disparaba: el lote
+/// entero fallaba de una.
+pub fn is_statement_too_large(err: &CoreError) -> bool {
+    if err.native_code().is_some_and(is_reducible_size) {
+        return true;
+    }
+    matches!(err.sqlstate(), Some("HY090"))
+}
+
 /// SQLCODEs transitorios de DB2 for i: fila/objeto en uso (SQL0913) o limite
 /// de recursos del sistema (SQL0904). Reintentar con backoff suele resolver.
 pub fn is_transient(native_code: i32) -> bool {
@@ -176,6 +194,16 @@ impl CoreError {
     pub fn native_code(&self) -> Option<i32> {
         match self {
             CoreError::Query { native_code, .. } => Some(*native_code),
+            _ => None,
+        }
+    }
+
+    /// `Some(sqlstate)` si es un `CoreError::Query`. Los errores de Driver
+    /// Manager (p.ej. HY090) llegan con `native_code == 0`, asi que la unica
+    /// forma de clasificarlos es por SQLSTATE.
+    pub fn sqlstate(&self) -> Option<&str> {
+        match self {
+            CoreError::Query { sqlstate, .. } => Some(sqlstate.as_str()),
             _ => None,
         }
     }

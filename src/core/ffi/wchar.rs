@@ -18,11 +18,17 @@ pub fn to_utf16(s: &str) -> Vec<WChar> {
     s.encode_utf16().collect()
 }
 
-/// Longitud en unidades UTF-16 (lo que ODBC espera en los parametros
-/// `*_length` de las funciones `-W`), acotada a `i16` porque los parametros
-/// de longitud de nombre de ODBC son `SmallInt`.
-pub fn utf16_len(s: &str) -> i16 {
-    s.encode_utf16().count() as i16
+/// Convierte el largo de un buffer (unidades UTF-16) al `SQLSMALLINT` que
+/// esperan los parametros de buffer/nombre de ODBC (`SQLDriverConnectW`,
+/// `SQLDescribeColW`, `SQLProcedureColumnsW`). Satura en vez de truncar en
+/// silencio: ningun DSN ni nombre de columna/procedimiento se acerca al
+/// limite, y un wrap silencioso a negativo seria un `cb*` invalido (HY090).
+///
+/// NO usar esto para `cbSqlStr` de `SQLExecDirectW`/`SQLPrepareW`: ese
+/// parametro es `SQLINTEGER` (i32), y pasarlo como i16 es exactamente el bug
+/// que hacia devolver HY090 con statements grandes (ver `stmt::exec_direct`).
+pub fn to_smallint(len: usize) -> i16 {
+    i16::try_from(len).unwrap_or(i16::MAX)
 }
 
 /// Decodifica un buffer UTF-16 crudo (posiblemente con basura despues del

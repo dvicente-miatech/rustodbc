@@ -62,10 +62,15 @@ pub(crate) async fn connect_impl(
 ) -> PyResult<core::Engine> {
     let pool_size = options.pool_size;
     let login_timeout = options.login_timeout;
-    tokio::task::spawn_blocking(move || core::Engine::connect(dsn, pool_size, login_timeout))
-        .await
-        .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
-        .map_err(to_py_err)
+    // 0 = sin cap configurado (el limite se descubre solo por halve-and-retry).
+    let max_statement_units =
+        (options.max_statement_units > 0).then_some(options.max_statement_units);
+    tokio::task::spawn_blocking(move || {
+        core::Engine::connect(dsn, pool_size, login_timeout, max_statement_units)
+    })
+    .await
+    .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
+    .map_err(to_py_err)
 }
 
 async fn run_blocking<T, F>(engine: &SharedEngine, f: F) -> PyResult<T>
@@ -219,14 +224,29 @@ pub(crate) async fn executebatch_impl(
     .map_err(to_py_err)
 }
 
+/// `executebatch` con `max_workers > 1`: reparte las piezas entre varias
+/// conexiones del pool (mismo contrato de `BulkReport`, `fail_fast`).
+pub(crate) async fn executebatch_parallel_impl(
+    engine: SharedEngine,
+    sql: String,
+    rows: Vec<Vec<ParamValue>>,
+    chunk_size: usize,
+    workers: usize,
+) -> PyResult<crate::bulk::BulkReport> {
+    crate::bulk::executebatch_parallel_async(&engine, sql, rows, chunk_size, workers)
+        .await
+        .map_err(to_py_err)
+}
+
 pub(crate) async fn batch_execute_impl(
     engine: SharedEngine,
     sql: String,
-    chunks: Vec<Vec<Vec<ParamValue>>>,
+    rows: Vec<Vec<ParamValue>>,
+    chunk_size: usize,
     workers: usize,
     fail_fast: bool,
 ) -> PyResult<crate::bulk::ParallelReport> {
-    crate::bulk::batch_execute_chunks_async(&engine, sql, chunks, workers, fail_fast)
+    crate::bulk::batch_execute_async(&engine, sql, rows, chunk_size, workers, fail_fast)
         .await
         .map_err(to_py_err)
 }
@@ -620,20 +640,29 @@ impl Db2iEngine {
     /// inserta `rows` en sub-lotes de `EngineOptions.batch_size` filas por
     /// statement. Ver `bulk::executebatch_core` para el detalle y las
     /// simplificaciones deliberadas de esta primera pasada.
-    #[pyo3(signature = (sql, rows))]
+    #[pyo3(signature = (sql, rows, *, max_workers=None))]
     fn executebatch<'py>(
         &self,
         py: Python<'py>,
         sql: String,
         rows: Bound<'py, PyAny>,
+        max_workers: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let rows = crate::bulk::rows_to_param_values(py, &rows)?;
         let engine = self.engine.clone();
         let chunk_size = self.options.batch_size;
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            executebatch_impl(engine, sql, rows, chunk_size),
-        )
+        let workers = max_workers.unwrap_or(1);
+        if workers <= 1 {
+            pyo3_async_runtimes::tokio::future_into_py(
+                py,
+                executebatch_impl(engine, sql, rows, chunk_size),
+            )
+        } else {
+            pyo3_async_runtimes::tokio::future_into_py(
+                py,
+                executebatch_parallel_impl(engine, sql, rows, chunk_size, workers),
+            )
+        }
     }
 
     /// Ejecuta `INSERT ... VALUES (?,...)` contra `rows` en paralelo
@@ -650,13 +679,12 @@ impl Db2iEngine {
         fail_fast: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let chunk_size = self.options.batch_size;
-        // 2d: convertir a chunks una sola vez (sin clonar filas por worker).
-        let chunks = crate::bulk::rows_to_chunks(py, &rows, chunk_size)?;
+        let rows = crate::bulk::rows_to_param_values(py, &rows)?;
         let engine = self.engine.clone();
         let workers = max_workers.unwrap_or(self.options.max_workers);
         pyo3_async_runtimes::tokio::future_into_py(
             py,
-            batch_execute_impl(engine, sql, chunks, workers, fail_fast),
+            batch_execute_impl(engine, sql, rows, chunk_size, workers, fail_fast),
         )
     }
 
@@ -819,6 +847,7 @@ impl Db2iEngine {
             self.engine.clone(),
             source.map(|s| s.borrow(py).engine.clone()),
             self.options.merge_chunk_size,
+            self.options.merge_max_workers,
             None,
         )
     }

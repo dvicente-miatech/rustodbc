@@ -1027,22 +1027,56 @@ impl managed::Manager for ConnManager {
 // Engine -- pool + DSN resuelto
 // ---------------------------------------------------------------------------
 
-/// Limites descubiertos de statement/parametros para este engine (ver
-/// AGENTS.md ss9, halve-and-retry contra SQL0101/SQL54001). Memoizado por
-/// engine (no global): cada `Engine` corresponde a un DSN/conexion y los
-/// limites reales de DB2 for i pueden variar entre sistemas.
+/// Limites de statement/parametros descubiertos para este engine (ver
+/// AGENTS.md ss9). Memoizado por engine (no global): cada `Engine` corresponde
+/// a un DSN/conexion y los limites reales pueden variar entre sistemas.
+///
+/// Se mide en **unidades UTF-16 del statement generado**, no en filas: asi una
+/// tabla angosta conserva lotes grandes aunque una ancha haya bajado el
+/// limite (un tope global de filas se degradaba para todas las tablas por
+/// igual). `budget_units()` combina la cota configurada, la mayor que se
+/// observo funcionar y la menor que fallo.
 #[derive(Debug, Default)]
 pub struct StatementLimits {
-    /// Maximas filas por statement multi-row (por columna) que el driver
-    /// acepta -- descubierto por halve-and-retry. `None` = todavia no se
-    /// probo.
-    pub max_rows_per_statement: Option<usize>,
+    /// Cap configurado via `EngineOptions.max_statement_units`
+    /// (`RUSTODBC_MAX_STATEMENT_UNITS`). Punto de partida; el cache nunca lo
+    /// supera. `None` = sin cap configurado.
+    pub configured_max_units: Option<usize>,
+    /// Mayor largo de statement (unidades UTF-16) observado OK.
+    pub max_statement_units: Option<usize>,
+    /// Menor largo de statement observado que fallo por tamano.
+    pub failed_statement_units: Option<usize>,
+}
+
+impl StatementLimits {
+    /// Presupuesto util de unidades UTF-16: el minimo entre lo configurado,
+    /// "lo mayor que funciono" y "lo menor que fallo - 1". `None` si todavia
+    /// no hay ninguna observacion (el caller usa su tamano pedido).
+    pub fn budget_units(&self) -> Option<usize> {
+        let failed = self.failed_statement_units.map(|f| f.saturating_sub(1));
+        [self.configured_max_units, self.max_statement_units, failed]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    pub fn record_ok(&mut self, units: usize) {
+        self.max_statement_units = Some(self.max_statement_units.map_or(units, |m| m.max(units)));
+    }
+
+    pub fn record_failed(&mut self, units: usize) {
+        self.failed_statement_units =
+            Some(self.failed_statement_units.map_or(units, |m| m.min(units)));
+    }
 }
 
 pub struct Engine {
     pool: Pool<ConnManager>,
     /// Cache de limites de statement descubiertos por halve-and-retry.
     pub limits: std::sync::Arc<std::sync::Mutex<StatementLimits>>,
+    /// Tamano del pool -- usado para acotar `workers` en la escritura masiva
+    /// (mas workers que conexiones solo esperan en `acquire`).
+    pub pool_size: usize,
 }
 
 impl Engine {
@@ -1050,6 +1084,7 @@ impl Engine {
         dsn: SecretString,
         pool_size: usize,
         login_timeout_secs: u32,
+        max_statement_units: Option<usize>,
     ) -> Result<Self, CoreError> {
         // Fuerza la inicializacion del Environment singleton temprano, para
         // fallar rapido si el linkeo con odbc32/unixODBC esta roto, antes de
@@ -1060,8 +1095,9 @@ impl Engine {
             dsn,
             login_timeout_secs,
         };
+        let pool_size = pool_size.max(1);
         let pool = Pool::builder(manager)
-            .max_size(pool_size.max(1))
+            .max_size(pool_size)
             .runtime(deadpool::Runtime::Tokio1)
             .wait_timeout(Some(Duration::from_secs(30)))
             .build()
@@ -1069,7 +1105,11 @@ impl Engine {
 
         Ok(Engine {
             pool,
-            limits: std::sync::Arc::new(std::sync::Mutex::new(StatementLimits::default())),
+            limits: std::sync::Arc::new(std::sync::Mutex::new(StatementLimits {
+                configured_max_units: max_statement_units,
+                ..StatementLimits::default()
+            })),
+            pool_size,
         })
     }
 

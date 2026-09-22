@@ -14,7 +14,7 @@ use crate::errors::CoreError;
 
 use super::diag::primary_diagnostic;
 use super::env::Environment;
-use super::wchar::{to_utf16, utf16_len};
+use super::wchar::{to_smallint, to_utf16};
 
 /// `SQL_AUTOCOMMIT_OFF` / `SQL_AUTOCOMMIT_ON` -- valores crudos porque
 /// `odbc-sys` 0.24 no los modela como enum (son valores del *value*, no del
@@ -79,7 +79,7 @@ impl RawConnection {
         }
 
         let dsn_u16 = to_utf16(dsn);
-        let dsn_len = utf16_len(dsn);
+        let dsn_len = to_smallint(dsn_u16.len());
         let mut out_buf = [0u16; 1024];
         let mut out_len: i16 = 0;
 

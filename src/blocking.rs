@@ -23,8 +23,8 @@ use crate::core::{Lease, ParamValue, SharedEngine};
 use crate::core::{ProcOutParams, ProcParam};
 use crate::engine::{
     batch_execute_impl, call_proc_args_impl, call_proc_impl, connect_impl, execute_impl,
-    executebatch_impl, fetch_all_impl, fetch_column_impl, fetch_one_impl, fetch_value_impl,
-    parallel_execute_impl, query_cursor_impl, resolve_dsn,
+    executebatch_impl, executebatch_parallel_impl, fetch_all_impl, fetch_column_impl,
+    fetch_one_impl, fetch_value_impl, parallel_execute_impl, query_cursor_impl, resolve_dsn,
 };
 use crate::errors::{to_py_err, CoreError};
 use crate::params::params_from_python;
@@ -214,18 +214,28 @@ impl BlockingEngine {
         )
     }
 
-    #[pyo3(signature = (sql, rows))]
+    #[pyo3(signature = (sql, rows, *, max_workers=None))]
     fn executebatch(
         &self,
         py: Python<'_>,
         sql: String,
         rows: Bound<'_, PyAny>,
+        max_workers: Option<usize>,
     ) -> PyResult<crate::bulk::BulkReport> {
         check_no_running_loop(py)?;
         let rows = crate::bulk::rows_to_param_values(py, &rows)?;
         let engine = self.engine.clone();
         let chunk_size = self.options.batch_size;
-        py.allow_threads(move || self.block_on(executebatch_impl(engine, sql, rows, chunk_size)))
+        let workers = max_workers.unwrap_or(1);
+        py.allow_threads(move || {
+            if workers <= 1 {
+                self.block_on(executebatch_impl(engine, sql, rows, chunk_size))
+            } else {
+                self.block_on(executebatch_parallel_impl(
+                    engine, sql, rows, chunk_size, workers,
+                ))
+            }
+        })
     }
 
     #[pyo3(signature = (sql, rows, *, max_workers=None, fail_fast=false))]
@@ -239,12 +249,13 @@ impl BlockingEngine {
     ) -> PyResult<crate::bulk::ParallelReport> {
         check_no_running_loop(py)?;
         let chunk_size = self.options.batch_size;
-        // 2d: convertir a chunks una sola vez (sin clonar filas por worker).
-        let chunks = crate::bulk::rows_to_chunks(py, &rows, chunk_size)?;
+        let rows = crate::bulk::rows_to_param_values(py, &rows)?;
         let engine = self.engine.clone();
         let workers = max_workers.unwrap_or(self.options.max_workers);
         py.allow_threads(move || {
-            self.block_on(batch_execute_impl(engine, sql, chunks, workers, fail_fast))
+            self.block_on(batch_execute_impl(
+                engine, sql, rows, chunk_size, workers, fail_fast,
+            ))
         })
     }
 
@@ -489,6 +500,7 @@ impl BlockingEngine {
             self.engine.clone(),
             source.map(|s| s.borrow(py).engine.clone()),
             self.options.merge_chunk_size,
+            self.options.merge_max_workers,
             Some(runtime),
         )
     }

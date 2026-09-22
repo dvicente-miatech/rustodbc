@@ -283,6 +283,12 @@ pub struct EngineOptions {
     pub stream_batch_size: usize,
     #[pyo3(get, set)]
     pub prefetch_batches: usize,
+    /// Presupuesto de largo del statement multi-row generado, en unidades
+    /// UTF-16. Punto de partida del halve-and-retry (ver AGENTS.md ss9): evita
+    /// mandar un lote que el Driver Manager va a rechazar con HY090. `0` =
+    /// sin cap (descubrir el limite solo por halve-and-retry).
+    #[pyo3(get, set)]
+    pub max_statement_units: usize,
     #[pyo3(get, set)]
     pub decimal_mode: String, // "decimal" | "str" | "float"
     #[pyo3(get, set)]
@@ -305,6 +311,10 @@ impl Default for EngineOptions {
             merge_max_workers: 3,
             stream_batch_size: 5000,
             prefetch_batches: 2,
+            // 16000 unidades UTF-16: por debajo del muro del Driver Manager
+            // observado (~16-21K) y muy por debajo del wrap i16 de 32767. El
+            // halve-and-retry solo puede bajarlo, nunca subirlo.
+            max_statement_units: 16000,
             decimal_mode: "decimal".to_string(),
             strip_char_padding: true,
         }
@@ -338,6 +348,10 @@ impl EngineOptions {
         read_env_usize(&mut opts.min_rows_per_worker, "MIN_ROWS_PER_WORKER")?;
         read_env_usize(&mut opts.merge_chunk_size, "MERGE_CHUNK_SIZE")?;
         read_env_usize(&mut opts.merge_max_workers, "MERGE_MAX_WORKERS")?;
+        read_env_usize(
+            &mut opts.max_statement_units,
+            "RUSTODBC_MAX_STATEMENT_UNITS",
+        )?;
         read_env_usize(&mut opts.pool_size, "RUSTODBC_POOL_SIZE")?;
         Ok(opts)
     }
@@ -381,6 +395,7 @@ fn apply_option(opts: &mut EngineOptions, key: &str, value: Bound<'_, PyAny>) ->
         "merge_max_workers" => set_usize!(merge_max_workers),
         "stream_batch_size" => set_usize!(stream_batch_size),
         "prefetch_batches" => set_usize!(prefetch_batches),
+        "max_statement_units" => set_usize!(max_statement_units),
         "decimal_mode" => {
             opts.decimal_mode = value.extract()?;
             Ok(())

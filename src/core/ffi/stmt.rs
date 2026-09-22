@@ -17,7 +17,7 @@ use odbc_sys::{
 use crate::errors::CoreError;
 
 use super::diag::primary_diagnostic;
-use super::wchar::{from_utf16_lossy, to_utf16, utf16_len};
+use super::wchar::{from_utf16_lossy, to_smallint, to_utf16};
 
 // `odbc-sys` 0.24 no expone `SQLProcedureColumns` como funcion FFI (aunque es
 // ODBC 3 estandar y existe en odbc32.lib/libodbc.so) -- se declara aca, en la
@@ -191,13 +191,17 @@ impl RawStatement {
     /// `ExecOutcome`.
     pub fn exec_direct(&self, sql: &str) -> Result<ExecOutcome, CoreError> {
         let sql_u16 = to_utf16(sql);
-        let ret = unsafe { SQLExecDirectW(self.hstmt, sql_u16.as_ptr(), utf16_len(sql) as i32) };
+        // `cbSqlStr` es SQLINTEGER (i32): el largo real del buffer, no un i16
+        // (un statement de >32767 unidades hacia wrap a negativo -> HY090).
+        let len = i32::try_from(sql_u16.len()).unwrap_or(i32::MAX);
+        let ret = unsafe { SQLExecDirectW(self.hstmt, sql_u16.as_ptr(), len) };
         self.classify_exec(ret)
     }
 
     pub fn prepare(&self, sql: &str) -> Result<(), CoreError> {
         let sql_u16 = to_utf16(sql);
-        let ret = unsafe { SQLPrepareW(self.hstmt, sql_u16.as_ptr(), utf16_len(sql) as i32) };
+        let len = i32::try_from(sql_u16.len()).unwrap_or(i32::MAX);
+        let ret = unsafe { SQLPrepareW(self.hstmt, sql_u16.as_ptr(), len) };
         self.check(ret)
     }
 
@@ -262,9 +266,9 @@ impl RawStatement {
                 ptr::null(),
                 0,
                 schema_u16.as_ptr(),
-                utf16_len(schema),
+                to_smallint(schema_u16.len()),
                 proc_u16.as_ptr(),
-                utf16_len(proc_name),
+                to_smallint(proc_u16.len()),
                 ptr::null(),
                 0,
             )

@@ -9,11 +9,11 @@
 //!   degrada a `INSERT` simple con warning antes de llegar aca.
 //! - Sin exito parcial silencioso: cada chunk que falla propaga el error tal
 //!   cual, sin intentar seguir con los chunks restantes.
-//! - Los limites de statement (SQL0101/SQL54001) se manejan con
-//!   halve-and-retry compartido con `executebatch` (ver
-//!   `crate::bulk::execute_chunked_with_limits`).
+//! - Los limites de statement (SQL0101/SQL54001 de DB2, HY090 del Driver
+//!   Manager) se manejan con halve-and-retry compartido con `executebatch`
+//!   (ver `crate::bulk::execute_chunked`).
 
-use crate::bulk::execute_chunked_with_limits;
+use crate::bulk::execute_chunked;
 use crate::core::{Lease, ParamValue, StatementLimits};
 use crate::errors::CoreError;
 
@@ -73,9 +73,38 @@ fn build_merge_sql(
     )
 }
 
+/// Builder del `MERGE INTO ... USING (VALUES ...) AS s(...)` para N filas.
+/// `Send + Sync` para poder correrlo en workers.
+pub(crate) fn merge_sql_builder(
+    schema: String,
+    table: String,
+    pk_columns: Vec<String>,
+    columns: Vec<String>,
+) -> impl Fn(usize) -> String + Send + Sync {
+    move |n: usize| build_merge_sql(&schema, &table, &pk_columns, &columns, n)
+}
+
+/// Builder del `INSERT ... VALUES (?,...),(?,...)` (sin PK -- ver regla dura
+/// de arriba) para N filas. `Send + Sync` para poder correrlo en workers.
+pub(crate) fn insert_sql_builder(
+    schema: String,
+    table: String,
+    columns: Vec<String>,
+) -> impl Fn(usize) -> String + Send + Sync {
+    let qualified_table = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
+    let cols_quoted: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
+    let row_placeholder = format!("({})", vec!["?"; columns.len()].join(","));
+    move |n: usize| {
+        let values_clause = vec![row_placeholder.clone(); n.max(1)].join(",");
+        format!(
+            "INSERT INTO {qualified_table} ({}) VALUES {values_clause}",
+            cols_quoted.join(",")
+        )
+    }
+}
+
 /// Ejecuta el MERGE en chunks de `chunk_size` filas, con halve-and-retry de
-/// chunk size contra SQL0101/SQL54001 (memoizado en `limits`). Devuelve
-/// `(rows_affected_total, chunks)`.
+/// tamano (memoizado en `limits`). Devuelve `(rows_affected_total, batches)`.
 #[allow(clippy::too_many_arguments)]
 pub fn merge_rows(
     lease: &Lease,
@@ -87,26 +116,13 @@ pub fn merge_rows(
     rows: &[Vec<ParamValue>],
     chunk_size: usize,
 ) -> Result<(i64, usize), CoreError> {
-    let cached = limits
-        .lock()
-        .unwrap()
-        .max_rows_per_statement
-        .unwrap_or(chunk_size);
-
-    let (total, chunks, discovered) = execute_chunked_with_limits(
-        lease,
-        chunk_size,
-        rows,
-        |n| build_merge_sql(schema, table, pk_columns, columns, n),
-        |chunk| chunk.iter().flat_map(|r| r.iter().cloned()).collect(),
-        Some(cached),
-    )?;
-
-    if let Some(d) = discovered {
-        limits.lock().unwrap().max_rows_per_statement = Some(d);
-    }
-
-    Ok((total, chunks))
+    let build = merge_sql_builder(
+        schema.to_string(),
+        table.to_string(),
+        pk_columns.to_vec(),
+        columns.to_vec(),
+    );
+    execute_chunked(lease, limits, &build, rows, chunk_size)
 }
 
 /// INSERT simple (sin PK -- ver regla dura de arriba), en los mismos chunks,
@@ -121,34 +137,6 @@ pub fn insert_only_rows(
     rows: &[Vec<ParamValue>],
     chunk_size: usize,
 ) -> Result<(i64, usize), CoreError> {
-    let qualified_table = format!("{}.{}", quote_ident(schema), quote_ident(table));
-    let cols_quoted: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
-    let row_placeholder = format!("({})", vec!["?"; columns.len()].join(","));
-
-    let cached = limits
-        .lock()
-        .unwrap()
-        .max_rows_per_statement
-        .unwrap_or(chunk_size);
-
-    let (total, chunks, discovered) = execute_chunked_with_limits(
-        lease,
-        chunk_size,
-        rows,
-        |n| {
-            let values_clause = vec![row_placeholder.clone(); n].join(",");
-            format!(
-                "INSERT INTO {qualified_table} ({}) VALUES {values_clause}",
-                cols_quoted.join(",")
-            )
-        },
-        |chunk| chunk.iter().flat_map(|r| r.iter().cloned()).collect(),
-        Some(cached),
-    )?;
-
-    if let Some(d) = discovered {
-        limits.lock().unwrap().max_rows_per_statement = Some(d);
-    }
-
-    Ok((total, chunks))
+    let build = insert_sql_builder(schema.to_string(), table.to_string(), columns.to_vec());
+    execute_chunked(lease, limits, &build, rows, chunk_size)
 }

@@ -23,6 +23,10 @@ use crate::core::{ColumnValue, ParamValue, SharedEngine};
 use crate::errors::to_py_err;
 use crate::params::param_value_from_python;
 
+/// Builder de un statement multi-fila (`n` filas -> SQL). `Arc` + `dyn` para
+/// compartirlo entre los workers de `crate::bulk::execute_workers_async`.
+type SqlBuilder = std::sync::Arc<dyn Fn(usize) -> String + Send + Sync>;
+
 #[pyclass(module = "rustodbc")]
 #[derive(Debug, Clone)]
 pub struct MergeReport {
@@ -337,11 +341,8 @@ async fn merge_report_async(
         }
     };
 
-    let (build, used_merge, warning): (
-        std::sync::Arc<dyn Fn(usize) -> String + Send + Sync>,
-        bool,
-        Option<String>,
-    ) = if pk_columns.is_empty() {
+    let (build, used_merge, warning): (SqlBuilder, bool, Option<String>) = if pk_columns.is_empty()
+    {
         // Regla dura AGENTS.md ss4: sin PK, INSERT con warning,
         // nunca crash y nunca MERGE silencioso sin clave.
         (

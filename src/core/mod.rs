@@ -485,9 +485,21 @@ fn bind_proc_params(
             if let Some(text) = param_value_to_text(values.get(i).and_then(|v| v.as_ref())) {
                 if !text.is_empty() {
                     let byte_len = text.len();
-                    let mut indicator = Box::new(odbc_sys::indicator::len_data_at_exec(
-                        byte_len as odbc_sys::Len,
-                    ));
+                    // SQL_LEN_DATA_AT_EXEC(length) segun ODBC: `(-length) +
+                    // SQL_LEN_DATA_AT_EXEC_OFFSET` (offset -100). odbc-sys 0.24
+                    // la expone en el modulo privado `indicator`, asi que se
+                    // replica aca con la misma aritmetica (a prueba de overflow).
+                    let lob_indicator = (byte_len as odbc_sys::Len)
+                        .checked_neg()
+                        .and_then(|v| v.checked_sub(100))
+                        .ok_or_else(|| {
+                            CoreError::Parameter(format!(
+                                "parametro {} ({}): tamano de LOB fuera de rango",
+                                i + 1,
+                                p.name,
+                            ))
+                        })?;
+                    let mut indicator = Box::new(lob_indicator);
                     stmt.bind_parameter(
                         param_no,
                         match p.io_type {

@@ -528,7 +528,13 @@ fn bind_proc_params(
                             _ => ParamType::Input,
                         },
                         CDataType::Char,
-                        SqlDataType(p.sql_type),
+                        // El driver IBM i Access ODBC NO acepta al bindear ni
+                        // los codigos ODBC de LOB (31/32) ni el empirico -99 de
+                        // SQLProcedureColumns: "SQL data type argument out of
+                        // range". Verificado contra el driver real (solo -1/12
+                        // entran). LONGVARCHAR(-1) es el tipo historico de
+                        // data-at-execution y el que este driver acepta.
+                        SqlDataType(SqlDataType::EXT_LONG_VARCHAR.0),
                         p.column_size,
                         p.decimal_digits,
                         // Token que el driver devuelve en SQLParamData: el
@@ -627,8 +633,8 @@ fn bind_proc_params(
 /// 2. Loop: `SQLParamData` devuelve el token del parametro (el numero 1-based
 ///    bindeado como `ParameterValuePtr`); se buscan sus bytes UTF-8 y se
 ///    entregan en chunks de 1 MB con `SQLPutData(ptr, len)`.
-/// 3. `SQLParamData` -> `NO_DATA`: listo, el statement sigue su curso normal
-///    (result sets / OUT).
+/// 3. `SQLParamData` -> `SQL_SUCCESS`: listo, el statement sigue su curso
+///    normal (result sets / OUT).
 ///
 /// El texto UTF-8 vive en `ProcParamBuffer::_lob_text` durante todo el ciclo;
 /// cada `SQLPutData` recibe un slice de ese texto y lo consume de forma
@@ -644,7 +650,7 @@ fn feed_lob_inputs(stmt: &RawStatement, buffers: &[ProcParamBuffer]) -> Result<(
     loop {
         let wanted = stmt.param_data()?;
         let Some(ptr) = wanted else {
-            return Ok(()); // NO_DATA: alimentacion completa.
+            return Ok(()); // SQL_SUCCESS: alimentacion completa.
         };
         // El token que devuelve `SQLParamData` es el `ParameterValuePtr` que se
         // bindeo (el numero de parametro 1-based como puntero; ver
@@ -675,9 +681,9 @@ fn feed_lob_inputs(stmt: &RawStatement, buffers: &[ProcParamBuffer]) -> Result<(
             )?;
             start = end;
         }
-        // Chunk final vacio = fin de datos de este parametro (requerido por
-        // la spec: `SQLPutData` con largo 0 cierra el valor).
-        stmt.put_data(std::ptr::null_mut(), 0)?;
+        // SIN chunk 0 de cierre: `SQL_LEN_DATA_AT_EXEC(length)` ya declara el
+        // total, y un `SQLPutData` de largo 0 adicional deja la secuencia en
+        // HY010 (verificado contra el driver IBM i Access ODBC real).
     }
 }
 

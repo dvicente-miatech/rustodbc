@@ -554,16 +554,27 @@ impl RawStatement {
     }
 
     /// `SQLParamData` -- en un flujo data-at-execution, recupera el puntero
-    /// del parametro que necesita datos (`SQL_NEED_DATA` de `SQLExecute`).
-    /// `Ok(None)` = ejecucion completa, ya no hay mas parametros pendientes.
+    /// del parametro que necesita datos. Devuelve `Ok(Some(token))` cuando el
+    /// driver pide datos (`SQL_NEED_DATA`) y `Ok(None)` cuando ya no hay
+    /// parametros pendientes (`SQL_SUCCESS`/`SUCCESS_WITH_INFO`/`NO_DATA`).
+    ///
+    /// OJO: el fin de la alimentacion llega como `SQL_SUCCESS`, NO como
+    /// `NO_DATA` (verificado contra el driver IBM i Access ODBC real). Tratar
+    /// `SUCCESS` como "otro parametro" haria fallar el lookup del token.
     pub fn param_data(&self) -> Result<Option<Pointer>, CoreError> {
         let mut value_ptr: Pointer = ptr::null_mut();
         let ret = unsafe { SQLParamData(self.hstmt, &mut value_ptr) };
-        if ret == SqlReturn::NO_DATA {
+        if ret == SqlReturn::NEED_DATA {
+            return Ok(Some(value_ptr));
+        }
+        if ret == SqlReturn::SUCCESS
+            || ret == SqlReturn::SUCCESS_WITH_INFO
+            || ret == SqlReturn::NO_DATA
+        {
             return Ok(None);
         }
         self.check(ret)?;
-        Ok(Some(value_ptr))
+        Ok(None)
     }
 
     /// `SQLPutData` -- entrega un chunk del valor del parametro actual en un

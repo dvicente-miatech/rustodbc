@@ -276,17 +276,38 @@ pub struct ProcParamError {
     pub message: String,
 }
 
+/// Familia SQL de un parametro de procedimiento. Primero por codigo numerico;
+/// si el codigo es desconocido (cae al default `Text`) pero `TYPE_NAME` del
+/// catalogo dice CLOB/DBCLOB -> `Clob` y BLOB -> `Binary`. Red de seguridad
+/// para codigos empíricos del driver que `classify_sql_type` no conoce, sin
+/// tocar la clasificacion de columnas (que no tiene `TYPE_NAME`).
+fn classify_proc_param(p: &ProcParam) -> SqlTypeFamily {
+    let family = classify_sql_type(p.sql_type);
+    if family != SqlTypeFamily::Text {
+        return family;
+    }
+    let name = p.type_name.to_ascii_uppercase();
+    if name.contains("CLOB") {
+        SqlTypeFamily::Clob
+    } else if name.contains("BLOB") {
+        SqlTypeFamily::Binary
+    } else {
+        family
+    }
+}
+
 /// Texto legible del tipo de un parametro de procedimiento, usado en mensajes
 /// de error de validacion. Ejemplos: `VARCHAR(1)`, `CHAR(3)`, `DECIMAL(5,2)`,
 /// `INTEGER`, `DATE`. Cae al nombre de la familia si el catalogo no reporto
 /// `TYPE_NAME`.
 pub fn format_param_type(p: &ProcParam) -> String {
+    let family = classify_proc_param(p);
     let base = if p.type_name.is_empty() {
-        format!("{:?}", classify_sql_type(p.sql_type))
+        format!("{family:?}")
     } else {
         p.type_name.clone()
     };
-    match classify_sql_type(p.sql_type) {
+    match family {
         SqlTypeFamily::Text | SqlTypeFamily::Clob => {
             if p.column_size > 0 {
                 format!("{base}({})", p.column_size)
@@ -356,7 +377,7 @@ pub fn validate_proc_param(
     let text = param_value_to_text(Some(v)).unwrap_or_default();
     let expected = format_param_type(param);
     let provided = text.clone();
-    let family = classify_sql_type(param.sql_type);
+    let family = classify_proc_param(param);
 
     let err = |message: String| ProcParamError {
         index,
@@ -481,7 +502,7 @@ fn bind_proc_params(
         // del catalogo (`p.sql_type`, no VARCHAR). UTF-8 (`SQL_C_CHAR`): el
         // driver IBM i Access ODBC no maneja CLOB por `SQL_C_WCHAR` (ver
         // `get_data_text_lob`).
-        if is_in && classify_sql_type(p.sql_type) == SqlTypeFamily::Clob {
+        if is_in && classify_proc_param(p) == SqlTypeFamily::Clob {
             if let Some(text) = param_value_to_text(values.get(i).and_then(|v| v.as_ref())) {
                 if !text.is_empty() {
                     let byte_len = text.len();

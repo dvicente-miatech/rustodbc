@@ -122,7 +122,15 @@ pub fn classify_sql_type(sql_type: i16) -> SqlTypeFamily {
         // columnas CLOB por SQL_C_WCHAR (devuelve sin datos; validado contra DEV
         // con CCSID 284 y 1208). 30 = SQL_BLOB (extension IBM como CLOB, sin
         // constante en odbc-sys): entra como Binary.
-        t if t == 31 || t == 32 || t == SqlDataType::EXT_LONG_VARCHAR.0 => SqlTypeFamily::Clob,
+        //
+        // -99 = codigo EMPIRICO del driver IBM i Access ODBC para un CLOB de
+        // procedimiento via `SQLProcedureColumns` (verificado 25-sep-2026
+        // contra DB2 for i real: P_JSON_PAYLOAD de PXAMSAT.SQP06212,
+        // CLOB(52428800), DATA_TYPE=-99 TYPE_NAME=CLOB). Sin esto cae al default
+        // `Text` y el bind lo trunca al buffer de 64K.
+        t if t == 31 || t == 32 || t == -99 || t == SqlDataType::EXT_LONG_VARCHAR.0 => {
+            SqlTypeFamily::Clob
+        }
         t if t == SqlDataType::EXT_BINARY.0
             || t == SqlDataType::EXT_VAR_BINARY.0
             || t == SqlDataType::EXT_LONG_VAR_BINARY.0

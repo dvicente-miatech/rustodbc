@@ -10,8 +10,8 @@ use std::ptr;
 use odbc_sys::{
     CDataType, HDbc, HStmt, HandleType, Len, Nullability, ParamType, Pointer, SQLAllocHandle,
     SQLBindParameter, SQLCancel, SQLCloseCursor, SQLDescribeColW, SQLExecDirectW, SQLExecute,
-    SQLFetch, SQLFreeHandle, SQLGetData, SQLMoreResults, SQLNumResultCols, SQLPrepareW,
-    SQLRowCount, SmallInt, SqlDataType, SqlReturn, ULen, WChar,
+    SQLFetch, SQLFreeHandle, SQLGetData, SQLMoreResults, SQLNumResultCols, SQLParamData,
+    SQLPrepareW, SQLPutData, SQLRowCount, SmallInt, SqlDataType, SqlReturn, ULen, WChar,
 };
 
 use crate::errors::CoreError;
@@ -196,6 +196,24 @@ impl RawStatement {
         let len = i32::try_from(sql_u16.len()).unwrap_or(i32::MAX);
         let ret = unsafe { SQLExecDirectW(self.hstmt, sql_u16.as_ptr(), len) };
         self.classify_exec(ret)
+    }
+
+    /// Variante de `exec_direct` para data-at-execution: si el driver pide
+    /// datos (`SQL_NEED_DATA`, hay parametros LOB bindeados con
+    /// `SQL_LEN_DATA_AT_EXEC`), devuelve `Ok(true)` -- el llamador debe correr
+    /// `SQLParamData`/`SQLPutData` (ver `feed_lob_inputs` en `core::mod`) y
+    /// DESPUES seguir con el flujo normal (result sets / OUT). Cualquier otro
+    /// retorno no exitoso sigue el criterio de `classify_exec`; `Ok(false)` =
+    /// ejecuto sin pedir datos.
+    pub fn exec_direct_need_data(&self, sql: &str) -> Result<bool, CoreError> {
+        let sql_u16 = to_utf16(sql);
+        let len = i32::try_from(sql_u16.len()).unwrap_or(i32::MAX);
+        let ret = unsafe { SQLExecDirectW(self.hstmt, sql_u16.as_ptr(), len) };
+        if ret == SqlReturn::NEED_DATA {
+            return Ok(true);
+        }
+        self.classify_exec(ret)?;
+        Ok(false)
     }
 
     pub fn prepare(&self, sql: &str) -> Result<(), CoreError> {
@@ -524,6 +542,27 @@ impl RawStatement {
     /// descarta la conexion asociada despues de esto, nunca la recicla.
     pub fn cancel(&self) -> Result<(), CoreError> {
         let ret = unsafe { SQLCancel(self.hstmt) };
+        self.check(ret)
+    }
+
+    /// `SQLParamData` -- en un flujo data-at-execution, recupera el puntero
+    /// del parametro que necesita datos (`SQL_NEED_DATA` de `SQLExecute`).
+    /// `Ok(None)` = ejecucion completa, ya no hay mas parametros pendientes.
+    pub fn param_data(&self) -> Result<Option<Pointer>, CoreError> {
+        let mut value_ptr: Pointer = ptr::null_mut();
+        let ret = unsafe { SQLParamData(self.hstmt, &mut value_ptr) };
+        if ret == SqlReturn::NO_DATA {
+            return Ok(None);
+        }
+        self.check(ret)?;
+        Ok(Some(value_ptr))
+    }
+
+    /// `SQLPutData` -- entrega un chunk del valor del parametro actual en un
+    /// flujo data-at-execution. `len_or_ind` es el largo del chunk en la
+    /// unidad del C type (ver `put_data_chunk_*`).
+    pub fn put_data(&self, data: Pointer, len_or_ind: Len) -> Result<(), CoreError> {
+        let ret = unsafe { SQLPutData(self.hstmt, data, len_or_ind) };
         self.check(ret)
     }
 

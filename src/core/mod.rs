@@ -215,9 +215,17 @@ pub struct ProcParam {
 /// escribe en el buffer ANTES de ejecutar; para OUT/INOUT el driver escribe el
 /// resultado EN el mismo buffer (o en `_out`) y deja la longitud en
 /// `_indicator` despues de `SQLExecute`. `read_out()` recupera el texto.
+///
+/// Los LOB de entrada (`LobIn`) NO reservan buffer: se bindean con
+/// `SQL_LEN_DATA_AT_EXEC` y se entregan por chunks con `SQLPutData`
+/// (`feed_lob_inputs`) despues de que `SQLExecute` devuelva `SQL_NEED_DATA`.
+/// El `String` completo vive en `_lob_text` hasta que termina la alimentacion.
 struct ProcParamBuffer {
     _buf: Vec<u16>,
     _indicator: Box<odbc_sys::Len>,
+    /// Texto de entrada de un parametro LOB (IN/INOUT de familia `Clob`).
+    /// Vive hasta que `feed_lob_inputs` termina de entregar sus chunks.
+    _lob_text: Option<String>,
 }
 
 impl ProcParamBuffer {
@@ -361,7 +369,7 @@ pub fn validate_proc_param(
     match family {
         // Largo en UTF-16 code units: la misma metrica que usa el bind
         // (`text.encode_utf16()`), asi validacion y bindeo coinciden.
-        SqlTypeFamily::Text | SqlTypeFamily::Clob => {
+        SqlTypeFamily::Text => {
             let len = text.encode_utf16().count();
             if len > param.column_size {
                 Err(err(format!(
@@ -374,6 +382,12 @@ pub fn validate_proc_param(
                 Ok(())
             }
         }
+        // Un LOB de entrada viaja por data-at-execution (`feed_lob_inputs`): no
+        // hay buffer que desbordar, el driver consume el valor por chunks. El
+        // catalogo reporta `column_size` como el maximo declarado del tipo, no
+        // como tope del bind -- validar contra eso rechazaria valores que el
+        // driver si acepta (p.ej. un CLOB(50M) justo en el limite).
+        SqlTypeFamily::Clob => Ok(()),
         SqlTypeFamily::Decimal => {
             if looks_numeric(&text) {
                 Ok(())
@@ -437,6 +451,14 @@ pub fn validate_proc_param(
 /// Bindeo de los parametros de un `CALL`. Igual que `bind_params`, los
 /// buffers deben seguir vivos hasta despues de `execute()` -- este `Vec` es
 /// quien los sostiene, y de donde `Lease::call_proc` lee los OUT despues.
+///
+/// Parametros de entrada de la familia `Clob` (IN/INOUT CLOB/DBCLOB/
+/// LONGVARCHAR) con valor NO VACIO van por **data-at-execution**
+/// (`feed_lob_inputs`, ver abajo): se bindean como `SQL_C_CHAR`/`CLOB` con
+/// `SQL_LEN_DATA_AT_EXEC(len)` y se entregan por chunks de 1 MB con
+/// `SQLPutData`, sin tope de tamano y sin copiar el valor completo mas de
+/// una vez. Los demas parametros usan el camino historico (buffer UTF-16
+/// capado a 64K, error explicito en vez de truncamiento silencioso).
 fn bind_proc_params(
     stmt: &RawStatement,
     params: &[ProcParam],
@@ -453,6 +475,47 @@ fn bind_proc_params(
         let is_in = p.io_type == ffi::stmt::SQL_PARAM_INPUT
             || p.io_type == ffi::stmt::SQL_PARAM_INPUT_OUTPUT;
 
+        // Rama LOB de entrada: CLOB/DBCLOB/LONGVARCHAR con texto no vacio.
+        // Data-at-execution: sin buffer de valor (el driver lo pide por
+        // chunks), indicador `SQL_LEN_DATA_AT_EXEC(len_bytes)` y SQL type real
+        // del catalogo (`p.sql_type`, no VARCHAR). UTF-8 (`SQL_C_CHAR`): el
+        // driver IBM i Access ODBC no maneja CLOB por `SQL_C_WCHAR` (ver
+        // `get_data_text_lob`).
+        if is_in && classify_sql_type(p.sql_type) == SqlTypeFamily::Clob {
+            if let Some(text) = param_value_to_text(values.get(i).and_then(|v| v.as_ref())) {
+                if !text.is_empty() {
+                    let byte_len = text.len();
+                    let mut indicator = Box::new(odbc_sys::indicator::len_data_at_exec(
+                        byte_len as odbc_sys::Len,
+                    ));
+                    stmt.bind_parameter(
+                        param_no,
+                        match p.io_type {
+                            ffi::stmt::SQL_PARAM_INPUT_OUTPUT => ParamType::InputOutput,
+                            _ => ParamType::Input,
+                        },
+                        CDataType::Char,
+                        SqlDataType(p.sql_type),
+                        p.column_size,
+                        p.decimal_digits,
+                        // Token que el driver devuelve en SQLParamData: el
+                        // numero de parametro (1-based) como puntero. La spec
+                        // manda de vuelta el ParameterValuePtr bindeado, no la
+                        // direccion del indicador.
+                        param_no as usize as odbc_sys::Pointer,
+                        byte_len as odbc_sys::Len,
+                        indicator.as_mut(),
+                    )?;
+                    buffers.push(ProcParamBuffer {
+                        _buf: Vec::new(),
+                        _indicator: indicator,
+                        _lob_text: Some(text),
+                    });
+                    continue;
+                }
+            }
+        }
+
         // El C++ (cursor.cpp) toma COLUMN_SIZE del catalogo, capa a [256, 64KB],
         // y bindea todo como texto. Aca lo mismo pero UTF-16.
         //
@@ -466,10 +529,22 @@ fn bind_proc_params(
         let mut indicator = Box::new(odbc_sys::Len::default());
 
         // Escribir el valor de entrada si lo hay (IN/INOUT); si no, NULL.
+        // Sin truncamiento silencioso: si el texto excede el buffer se
+        // devuelve error explicito (la validacion de `validate_proc_param`
+        // ya lo detecta antes; esto es la red de seguridad).
         if is_in {
             if let Some(text) = param_value_to_text(values.get(i).and_then(|v| v.as_ref())) {
                 let units = text.encode_utf16().collect::<Vec<_>>();
-                let n = units.len().min(cap);
+                if units.len() > cap {
+                    return Err(CoreError::Parameter(format!(
+                        "parametro {} ({}): el valor ({} unidades) excede el buffer de {} del bind",
+                        i + 1,
+                        p.name,
+                        units.len(),
+                        cap,
+                    )));
+                }
+                let n = units.len();
                 buf[..n].copy_from_slice(&units[..n]);
                 *indicator = (n * std::mem::size_of::<u16>()) as odbc_sys::Len;
             } else {
@@ -504,10 +579,73 @@ fn bind_proc_params(
         buffers.push(ProcParamBuffer {
             _buf: buf,
             _indicator: indicator,
+            _lob_text: None,
         });
     }
 
     Ok(buffers)
+}
+
+/// Entrega los parametros LOB de entrada por chunks (`SQLPutData`) despues de
+/// que `execute()` devuelva `SQL_NEED_DATA`.
+///
+/// Flujo:
+/// 1. `SQLExecute` -> `SQL_NEED_DATA`: hay data-at-exec pendientes.
+/// 2. Loop: `SQLParamData` devuelve el token del parametro (el numero 1-based
+///    bindeado como `ParameterValuePtr`); se buscan sus bytes UTF-8 y se
+///    entregan en chunks de 1 MB con `SQLPutData(ptr, len)`.
+/// 3. `SQLParamData` -> `NO_DATA`: listo, el statement sigue su curso normal
+///    (result sets / OUT).
+///
+/// El texto UTF-8 vive en `ProcParamBuffer::_lob_text` durante todo el ciclo;
+/// cada `SQLPutData` recibe un slice de ese texto y lo consume de forma
+/// sincronica, antes de retornar. Si el driver pide un parametro que no es LOB
+/// registrado, se devuelve error en vez de inventar datos.
+pub fn feed_lob_inputs(stmt: &RawStatement, buffers: &[ProcParamBuffer]) -> Result<(), CoreError> {
+    const CHUNK: usize = 1024 * 1024;
+
+    if !buffers.iter().any(|b| b._lob_text.is_some()) {
+        return Ok(());
+    }
+
+    loop {
+        let wanted = stmt.param_data()?;
+        let Some(ptr) = wanted else {
+            return Ok(()); // NO_DATA: alimentacion completa.
+        };
+        // El token que devuelve `SQLParamData` es el `ParameterValuePtr` que se
+        // bindeo (el numero de parametro 1-based como puntero; ver
+        // `bind_proc_params`). NO es la direccion del indicador.
+        let idx = (ptr as usize)
+            .checked_sub(1)
+            .filter(|&k| k < buffers.len())
+            .filter(|&k| buffers[k]._lob_text.is_some())
+            .ok_or_else(|| {
+                CoreError::Parameter(format!(
+                    "el driver pidio data-at-execution de un parametro no registrado como LOB (token {})",
+                    ptr as usize,
+                ))
+            })?;
+        let bytes = buffers[idx]._lob_text.as_deref().unwrap_or("").as_bytes();
+        // Chunks de 1 MB sin partir un caracter UTF-8 multibyte al medio: el
+        // driver interpreta la secuencia de `SQLPutData` como un flujo de
+        // bytes, y un corte a mitad de secuencia lo corrompe.
+        let mut start = 0;
+        while start < bytes.len() {
+            let mut end = (start + CHUNK).min(bytes.len());
+            while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+                end -= 1;
+            }
+            stmt.put_data(
+                bytes[start..end].as_ptr() as odbc_sys::Pointer,
+                (end - start) as odbc_sys::Len,
+            )?;
+            start = end;
+        }
+        // Chunk final vacio = fin de datos de este parametro (requerido por
+        // la spec: `SQLPutData` con largo 0 cierra el valor).
+        stmt.put_data(std::ptr::null_mut(), 0)?;
+    }
 }
 
 /// Valor de columna crudo, ya leido del driver pero sin convertir a un tipo
@@ -877,7 +1015,17 @@ impl Lease {
 
         let stmt = RawStatement::alloc(self.hdbc())?;
         let buffers = bind_proc_params(&stmt, metadata, values)?;
-        stmt.exec_direct(&sql)?;
+        // Si hay LOBs de entrada por data-at-execution, `exec_direct` puede
+        // devolver `SQL_NEED_DATA`: hay que alimentar los chunks ANTES de
+        // seguir (ver `feed_lob_inputs`). Si el driver no los pidio (no
+        // deberia, pero podria), no se alimenta nada.
+        if buffers.iter().any(|b| b._lob_text.is_some()) {
+            if stmt.exec_direct_need_data(&sql)? {
+                feed_lob_inputs(&stmt, &buffers)?;
+            }
+        } else {
+            stmt.exec_direct(&sql)?;
+        }
 
         let out_indices: Vec<usize> = metadata
             .iter()

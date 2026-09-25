@@ -561,6 +561,9 @@ impl RawStatement {
     /// `SQLPutData` -- entrega un chunk del valor del parametro actual en un
     /// flujo data-at-execution. `len_or_ind` es el largo del chunk en la
     /// unidad del C type (ver `put_data_chunk_*`).
+    // Wrapper seguro: el puntero lo consume el driver en la llamada, nunca se
+    // deref en Rust (mismo criterio que `bind_parameter`).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn put_data(&self, data: Pointer, len_or_ind: Len) -> Result<(), CoreError> {
         let ret = unsafe { SQLPutData(self.hstmt, data, len_or_ind) };
         self.check(ret)

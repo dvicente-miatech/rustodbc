@@ -613,7 +613,7 @@ fn bind_proc_params(
 /// cada `SQLPutData` recibe un slice de ese texto y lo consume de forma
 /// sincronica, antes de retornar. Si el driver pide un parametro que no es LOB
 /// registrado, se devuelve error en vez de inventar datos.
-pub fn feed_lob_inputs(stmt: &RawStatement, buffers: &[ProcParamBuffer]) -> Result<(), CoreError> {
+fn feed_lob_inputs(stmt: &RawStatement, buffers: &[ProcParamBuffer]) -> Result<(), CoreError> {
     const CHUNK: usize = 1024 * 1024;
 
     if !buffers.iter().any(|b| b._lob_text.is_some()) {

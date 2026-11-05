@@ -417,6 +417,15 @@ explícita con `primary_key=[...]`.
 Sin PK → hace INSERT simple con `warning` (nunca crashea ni hace MERGE
 silencioso — regla dura de AGENTS.md ss4).
 
+Las marcas de parámetro del `VALUES` van **tipadas** (`CAST(? AS <tipo>)`), con
+el tipo que el catálogo del destino (`QSYS2.SYSCOLUMNS`) declara para cada
+columna. Db2 for i rechaza un `VALUES` con marcas sin tipo cuando alimenta un
+MERGE (`SQL0584 - En VALUES, no se permite NULL, UNKNOWN o un marcador de
+parámetro`), y ese `VALUES` es justamente el camino del MERGE/INSERT. Un tipo no
+mapeado (ROWID, XML, tipos distintos) queda sin `CAST` y falla con el mismo
+SQL0584 en vez de inventarse un tipo; un valor más ancho que la columna destino
+también es error (`SQL22001`/`CWB0111`), no un ajuste silencioso.
+
 #### Copiar tabla desde otro engine (`transfer`)
 
 Lee `source_schema.source_table` desde el engine `source` **en streaming**

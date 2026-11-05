@@ -83,6 +83,15 @@ impl TableSync {
     }
 }
 
+/// Tipos de CAST alineados con `columns` (texto vacio = tipo no mapeado, la
+/// marca queda sin `CAST`).
+fn cast_list(types: &std::collections::HashMap<String, String>, columns: &[String]) -> Vec<String> {
+    columns
+        .iter()
+        .map(|c| types.get(&c.to_uppercase()).cloned().unwrap_or_default())
+        .collect()
+}
+
 fn records_to_columns_and_rows(
     py: Python<'_>,
     records: &Bound<'_, PyAny>,
@@ -326,20 +335,25 @@ async fn merge_report_async(
         });
     }
 
-    let pk_columns = match primary_key {
-        Some(pk) => pk,
-        None => {
-            let lease = dest.acquire().await.map_err(to_py_err)?;
-            let schema2 = schema.clone();
-            let table2 = table.clone();
-            tokio::task::spawn_blocking(move || {
-                catalog::primary_key_columns(&lease, &schema2, &table2)
-            })
-            .await
-            .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
-            .map_err(to_py_err)?
-        }
-    };
+    // Una sola lectura de catalogo por merge: la PK (si el caller no la paso) y
+    // los tipos de columna destino. Sin esos tipos, Db2 for i rechaza el
+    // `USING (VALUES ...)` con SQL0584.
+    let lease = dest.acquire().await.map_err(to_py_err)?;
+    let schema_cat = schema.clone();
+    let table_cat = table.clone();
+    let (pk_columns, dest_types) = tokio::task::spawn_blocking(move || {
+        let pk = match primary_key {
+            Some(pk) => pk,
+            None => catalog::primary_key_columns(&lease, &schema_cat, &table_cat)?,
+        };
+        let types = catalog::column_cast_types(&lease, &schema_cat, &table_cat)?;
+        Ok::<_, crate::errors::CoreError>((pk, types))
+    })
+    .await
+    .map_err(|e| to_py_err(crate::errors::CoreError::Connect(format!("panic: {e}"))))?
+    .map_err(to_py_err)?;
+
+    let casts = cast_list(&dest_types, &columns);
 
     let (build, used_merge, warning): (SqlBuilder, bool, Option<String>) = if pk_columns.is_empty()
     {
@@ -350,6 +364,7 @@ async fn merge_report_async(
                 schema.clone(),
                 table.clone(),
                 columns.clone(),
+                casts,
             )),
             false,
             Some(format!(
@@ -364,6 +379,7 @@ async fn merge_report_async(
                 table.clone(),
                 pk_columns,
                 columns.clone(),
+                casts,
             )),
             true,
             None,
@@ -427,6 +443,12 @@ fn transfer_report_sync(
     };
     let use_merge = !pk_columns.is_empty();
 
+    // Igual que `merge()`: el `VALUES` del MERGE necesita el tipo de cada
+    // columna destino.
+    let dest_types =
+        catalog::column_cast_types(dest_lease, dest_schema, dest_table).map_err(to_py_err)?;
+    let casts = cast_list(&dest_types, &columns);
+
     let mut total = 0i64;
     let mut batches = 0usize;
 
@@ -457,6 +479,7 @@ fn transfer_report_sync(
                 dest_table,
                 &pk_columns,
                 &columns,
+                &casts,
                 &rows,
                 chunk_size,
             )
@@ -468,6 +491,7 @@ fn transfer_report_sync(
                 dest_schema,
                 dest_table,
                 &columns,
+                &casts,
                 &rows,
                 chunk_size,
             )

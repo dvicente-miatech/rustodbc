@@ -187,6 +187,7 @@ RustOdbcError
 ├── ConnectError             # fallo de SQLConnect
 │   └── PoolTimeout          # se agotó el tiempo esperando una conexión libre del pool
 ├── InterfaceError           # uso inválido de la API (p.ej. conexión ya cerrada)
+├── PreCallError             # el fallo ocurrió ANTES de enviar el CALL (pool/catálogo): reintentar con conexión nueva es seguro
 ├── QueryError               # error de ejecución de SQL
 │   ├── SqlSyntaxError       # SQLSTATE 42xxx
 │   ├── IntegrityError       # SQLSTATE 23xxx (p.ej. violación de PK/FK)

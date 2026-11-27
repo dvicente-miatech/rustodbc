@@ -18,6 +18,12 @@ create_exception!(rustodbc, ConfigurationError, RustOdbcError);
 create_exception!(rustodbc, ConnectError, RustOdbcError);
 create_exception!(rustodbc, PoolTimeout, ConnectError);
 create_exception!(rustodbc, InterfaceError, RustOdbcError);
+// El fallo ocurrio ANTES de enviar el `CALL` (pool/`acquire`, lectura de
+// metadata del catalogo): la conexion puede estar muerta pero el
+// procedimiento de negocio NUNCA llego a ejecutarse -- reintentar con una
+// conexion nueva es seguro. Todo otro error (el `CALL` ya viajo o su estado
+// es desconocido) NO es reintentable desde el cliente.
+create_exception!(rustodbc, PreCallError, RustOdbcError);
 create_exception!(rustodbc, QueryError, RustOdbcError);
 create_exception!(rustodbc, SqlSyntaxError, QueryError); // SQLSTATE 42xxx
 create_exception!(rustodbc, IntegrityError, QueryError); // SQLSTATE 23xxx
@@ -40,6 +46,7 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ConnectError", py.get_type_bound::<ConnectError>())?;
     m.add("PoolTimeout", py.get_type_bound::<PoolTimeout>())?;
     m.add("InterfaceError", py.get_type_bound::<InterfaceError>())?;
+    m.add("PreCallError", py.get_type_bound::<PreCallError>())?;
     m.add("QueryError", py.get_type_bound::<QueryError>())?;
     m.add("SqlSyntaxError", py.get_type_bound::<SqlSyntaxError>())?;
     m.add("IntegrityError", py.get_type_bound::<IntegrityError>())?;
@@ -207,6 +214,14 @@ impl CoreError {
             _ => None,
         }
     }
+}
+
+/// Convierte un error de una etapa ANTES del `CALL` (pool/`acquire`, metadata
+/// del catalogo) en `PreCallError`. El mensaje original viaja intacto (con el
+/// SQLSTATE/codigo dentro del texto, tras `scrub_password`) para que el
+/// consumidor pueda registrar el motivo real.
+pub fn to_pre_call_err(err: CoreError) -> PyErr {
+    PreCallError::new_err(scrub_password(&err.to_string()))
 }
 
 /// Convierte un `CoreError` en la excepcion Python concreta que le corresponde

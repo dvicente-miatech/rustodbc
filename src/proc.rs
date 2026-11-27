@@ -29,6 +29,8 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use crate::errors::to_pre_call_err;
+
 use crate::core::ffi::stmt::SQL_PARAM_OUTPUT;
 use crate::core::ffi::ColumnMeta;
 use crate::core::{
@@ -392,10 +394,16 @@ pub fn call_proc_args_sync(
     // con el orden de errores original): un dict u otra cosa no es secuencia.
     let items = positional_items(params)?;
 
-    // 1. Lease + metadata, con el GIL liberado.
+    // 1. Lease + metadata, con el GIL liberado. Un fallo ACA significa que el
+    //    CALL todavia no se envio: se reporta como `PreCallError` (subclase de
+    //    `RustOdbcError`, NO de QueryError/ConnectError) para que el consumidor
+    //    sepa que reintentar con una conexion nueva es seguro. El mensaje
+    //    original (SQLSTATE/CWBCO incluidos) viaja dentro del texto.
     let (lease, metadata) = py.allow_threads(|| {
-        let lease = futures::executor::block_on(engine.acquire()).map_err(to_py_err)?;
-        let metadata = lease.proc_columns(schema, proc_name).map_err(to_py_err)?;
+        let lease = futures::executor::block_on(engine.acquire()).map_err(to_pre_call_err)?;
+        let metadata = lease
+            .proc_columns(schema, proc_name)
+            .map_err(to_pre_call_err)?;
         Ok::<_, PyErr>((lease, metadata))
     })?;
     if metadata.is_empty() {

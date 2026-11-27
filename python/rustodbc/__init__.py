@@ -26,6 +26,7 @@ from ._rustodbc import (
     ParallelReport,
     ParameterError,
     PoolTimeout,
+    PreCallError,
     ProcResult,
     ProcStream,
     ProcValidationError,
